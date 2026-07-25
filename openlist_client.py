@@ -14,6 +14,7 @@ API 路径与字段名严格对齐 AList v3 / OpenList 官方文档。
 from urllib.parse import quote, urljoin, urlparse
 
 import requests
+import time
 
 
 class OpenListError(RuntimeError):
@@ -29,17 +30,75 @@ class OpenListClient:
         self.token: str | None = None
         self.session = requests.Session()
         self._netloc = urlparse(self.base_url).netloc
+        self._html_prefixes = ("<!doctype", "<html", "<!DOCTYPE", "<?xml")
+
+    # ------------------------------------------------------------------ 唤醒
+    def _looks_html(self, text: str) -> bool:
+        head = (text or "").lstrip()[:20].lower()
+        return any(head.startswith(p) for p in self._html_prefixes)
+
+    def _wake_once(self) -> None:
+        """GET 根路径以触发休眠中的 HF Space 唤醒（忽略结果）。
+
+        休眠的 HF Space 在首个请求时会返回 HTML warming 页，反复访问根路径
+        可促使其实例被拉起，之后真正的 API 调用才会返回 JSON。
+        """
+        try:
+            self.session.get(self.base_url + "/", timeout=min(self.timeout, 30), allow_redirects=True)
+        except requests.RequestException:
+            pass
+
+    def _with_wake_retry(self, do_request, url: str, max_retries: int = 3):
+        """执行请求并解析 JSON，带「唤醒 + 重试」逻辑。
+
+        - 网络层异常（休眠实例连接被拒 / 超时）会触发唤醒后重试；
+        - 返回非 JSON（HTML warming 页 / 代理拦截页）同样触发唤醒后重试；
+        - 最终失败抛出含 HTTP 状态与响应片段的清晰错误，便于排查。
+        """
+        last_err: str = "未知错误"
+        for attempt in range(max_retries + 1):
+            try:
+                resp = do_request()
+            except requests.RequestException as exc:
+                last_err = f"网络层异常: {exc}"
+                self._wake_once()
+                if attempt < max_retries:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise OpenListError(
+                    f"请求 {url} 失败（{last_err}）。\n"
+                    f"若目标是 HF Space，请确认：① 该 Space 已启动；② 已在 Settings 开启 Internet access；③ URL 正确。"
+                )
+            try:
+                return resp.json()
+            except ValueError:
+                last_err = f"返回非 JSON（HTTP {resp.status_code}）"
+                # 休眠实例常返回 HTML warming 页，唤醒后重试
+                self._wake_once()
+                if attempt < max_retries:
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                snippet = (resp.text or "").strip()[:200]
+                hint = "响应为 HTML，大概率是休眠的 HF Space 返回的 warming 页面或代理拦截页。" \
+                    if self._looks_html(resp.text or "") else ""
+                raise OpenListError(
+                    f"{url} {last_err}。{hint}\n"
+                    f"若目标是 HF Space，请确认：① 实例已唤醒/启动；② 已开启 Internet access；③ URL/端口正确。\n"
+                    f"响应片段: {snippet!r}"
+                )
+        # 理论上不会到达
+        raise OpenListError(f"请求 {url} 异常: {last_err}")
 
     # ------------------------------------------------------------------ 基础
     def login(self) -> str:
         """登录并缓存 token。"""
         url = f"{self.base_url}/api/auth/login"
-        resp = self.session.post(
-            url,
-            json={"username": self.username, "password": self.password},
-            timeout=self.timeout,
-        )
-        data = resp.json()
+        payload = {"username": self.username, "password": self.password}
+
+        def do():
+            return self.session.post(url, json=payload, timeout=self.timeout)
+
+        data = self._with_wake_retry(do, url)
         if data.get("code") != 200:
             raise OpenListError(f"登录失败: {data.get('message')}")
         self.token = data["data"]["token"]
@@ -51,15 +110,15 @@ class OpenListClient:
         if self.token is None:
             self.login()
         url = f"{self.base_url}{path}"
-        resp = self.session.request(method, url, timeout=self.timeout, **kwargs)
-        if resp.status_code == 401:
-            self.login()
+
+        def do():
             resp = self.session.request(method, url, timeout=self.timeout, **kwargs)
-        try:
-            data = resp.json()
-        except ValueError:
-            resp.raise_for_status()
-            raise OpenListError(f"{path} 返回非 JSON: {resp.text[:200]}")
+            if resp.status_code == 401:
+                self.login()
+                return self.session.request(method, url, timeout=self.timeout, **kwargs)
+            return resp
+
+        data = self._with_wake_retry(do, url)
         if data.get("code") != 200:
             raise OpenListError(f"接口 {path} 失败: code={data.get('code')} msg={data.get('message')}")
         return data
@@ -165,6 +224,13 @@ class OpenListClient:
             data = resp.json()
         except ValueError:
             resp.raise_for_status()
-            raise OpenListError(f"上传 {full_path} 返回非 JSON: {resp.text[:200]}")
+            snippet = (resp.text or "").strip()[:200]
+            hint = "响应为 HTML，大概率是休眠的 HF Space warming 页或代理拦截页。" \
+                if self._looks_html(resp.text or "") else ""
+            raise OpenListError(
+                f"上传 {full_path} 返回非 JSON（HTTP {resp.status_code}）。{hint}\n"
+                f"若目标是 HF Space，请确认已唤醒、已开启 Internet access、URL 正确。\n"
+                f"响应片段: {snippet!r}"
+            )
         if data.get("code") != 200:
             raise OpenListError(f"上传 {full_path} 失败: code={data.get('code')} msg={data.get('message')}")

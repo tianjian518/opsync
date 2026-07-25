@@ -9,8 +9,17 @@ import pathlib
 SRC = pathlib.Path("/workspace/opsync")
 OUT = SRC / "hf-space" / "Dockerfile"
 
-# 运行时需要的文件（顺序无关）
-files = ["requirements.txt", "openlist_client.py", "sync.py", "main.py", "config.toml"]
+# 运行时需要的文件（顺序无关）。注意必须包含 web.py 与 confighelper.py，
+# 否则 Web 入口（main.py -> from web import run）在镜像内会找不到模块而崩溃。
+files = [
+    "requirements.txt",
+    "confighelper.py",
+    "openlist_client.py",
+    "sync.py",
+    "web.py",
+    "main.py",
+    "config.toml",
+]
 
 parts = [
     "FROM python:3.11-slim",

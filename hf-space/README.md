@@ -50,4 +50,17 @@ docker run --rm -p 7860:7860 \
 # 然后浏览器打开 http://127.0.0.1:7860
 ```
 
+## 排错：连接测试 / 搬运时「连不上」
+
+- **Docker Space 必须开启联网**：在 Space 的 **Settings → 勾选 "Internet access"**（默认可能是关的）。
+  否则容器**完全无法访问外网**，连你自己的 OpenList 也会全部失败（包括换了好几个都不行）。
+  这是「换了好几个都连不上」最常见的原因——不是地址/账号问题，而是 Space 出不去网。
+- **目标 OpenList 是个休眠的 HF Space**：首个请求会被返回一段 HTML（warming 页面），
+  于是客户端报「返回非 JSON」。现在客户端会自动重试唤醒，稍等几秒再测即可；
+  若仍失败，错误信息会明确提示「响应为 HTML，大概率是休眠的 HF Space warming 页面」。
+- **看错误原文**：连接测试 / 浏览目录 / 运行时若失败，界面会直接显示**带 HTTP 状态码和响应片段**的报错，
+  不再是难懂的 `Expecting value`。例如 `... 返回非 JSON（HTTP 200）。响应为 HTML ...`，
+  据此判断是「休眠 warming 页」「代理拦截」还是「地址/端口错误」。
+- 确认 OpenList 地址以 `http(s)://` 开头、端口正确，且账号密码无误（登录接口 `code != 200` 会显示具体原因）。
+
 源码见 GitHub：`https://github.com/tianjian518/opsync`
