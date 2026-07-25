@@ -1,4 +1,5 @@
 .git
+.github
 hf-space
 data
 __pycache__

@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# 需要 packages:write 才能把镜像推到 GHCR；contents:read 用于拉取源码。
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      # 启用 QEMU，让 x86 runner 也能构建 arm64 镜像
+      - name: 设置 QEMU（多架构仿真）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Docker Buildx
+        uses: actions/setup-buildx-action@v3
+
+      # 始终推送到 GHCR（用仓库自带的 GITHUB_TOKEN 即可，无需额外秘钥）
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 可选：若仓库配置了 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN 两个 Secrets，
+      # 则同时推送到 Docker Hub（沿用你之前的镜像名）。
+      - name: 登录 Docker Hub（可选）
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 主构建：同时产出 linux/amd64 与 linux/arm64，推送到 GHCR
+      - name: 构建并推送（GHCR，多架构）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/tianjian518/opsync:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 可选：同样的多架构镜像推到 Docker Hub（仅当配置了秘钥）
+      - name: 构建并推送（Docker Hub，多架构）
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: tianjian518/opsync:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
