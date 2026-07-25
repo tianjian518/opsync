@@ -11,6 +11,7 @@
 import datetime
 import logging
 import os
+import platform
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -131,6 +132,12 @@ def scheduler_loop() -> None:
 @app.route("/")
 def index():
     return HTML
+
+
+@app.route("/healthz")
+def healthz():
+    """轻量健康检查端点，供 HF Space 等平台的存活探测使用。"""
+    return jsonify({"ok": True, "arch": platform.machine()})
 
 
 @app.route("/api/connection-test", methods=["POST"])
@@ -435,5 +442,8 @@ load(); poll();
 
 def run() -> None:
     threading.Thread(target=scheduler_loop, daemon=True).start()
-    _log.info("opsync Web 已启动，监听端口 %s", PORT)
+    _log.info(
+        "opsync Web 已启动：监听端口 %s，架构=%s，Python=%s，配置路径=%s",
+        PORT, platform.machine(), platform.python_version(), save_path(),
+    )
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)

@@ -11,34 +11,69 @@ permissions:
   packages: write
 
 jobs:
-  build:
+  # amd64 在 x86 runner 上原生构建（无需仿真）
+  build-amd64:
     runs-on: ubuntu-latest
     steps:
       - name: 检出源码
         uses: actions/checkout@v4
-
-      # 启用 QEMU，让 x86 runner 也能构建 arm64 镜像
-      - name: 设置 QEMU（多架构仿真）
-        uses: docker/setup-qemu-action@v3
-
       - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      # 推送到 GHCR（用仓库自带的 GITHUB_TOKEN 即可，无需额外秘钥）
       - name: 登录 GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # 同时产出 linux/amd64 与 linux/arm64 的多架构镜像，推送到 GHCR
-      - name: 构建并推送（多架构）
+      - name: 构建并推送 amd64
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
-          tags: ghcr.io/tianjian518/opsync:latest
+          tags: ghcr.io/tianjian518/opsync:amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # arm64 在原生 ARM runner 上构建（避免 QEMU 仿真在真实 ARM CPU 上引入的细微问题）
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 构建并推送 arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ghcr.io/tianjian518/opsync:arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 合并两个平台的镜像为多架构 manifest 列表（:latest）
+  manifest:
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 创建多架构 manifest 列表
+        run: |
+          docker buildx imagetools create --tag ghcr.io/tianjian518/opsync:latest \
+            ghcr.io/tianjian518/opsync:amd64 \
+            ghcr.io/tianjian518/opsync:arm64
+      - name: 打印多架构 digest
+        run: docker buildx imagetools inspect ghcr.io/tianjian518/opsync:latest
