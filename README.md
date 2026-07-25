@@ -115,7 +115,7 @@ docker build -t opsync .
 docker run -d -p 7860:7860 -v $(pwd)/data:/data opsync
 ```
 
-镜像已发布在 `docker.io/tianjian518/opsync:latest`，可直接 `FROM` 使用。
+镜像已发布在 `ghcr.io/tianjian518/opsync:latest`（**多架构：amd64 + arm64**，由 GitHub Actions 自动构建），可直接 `FROM` 使用。
 
 ## 说明
 

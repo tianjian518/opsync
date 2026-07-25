@@ -13,8 +13,9 @@ pinned: false
 带一个**浏览器管理界面**：多账号、填连接、浏览选目录、建多条路线、手动触发、看日志全在网页里完成。
 
 本 Space 只改了 `Dockerfile`（一行 `FROM` 镜像）和这个 `README`，源码与镜像都在
-[docker.io/tianjian518/opsync](https://hub.docker.com/r/tianjian518/opsync)，
-Space 里无需放任何代码。容器启动后监听 `$PORT`（默认 7860），打开 Space 页面即是管理界面。
+[ghcr.io/tianjian518/opsync](https://ghcr.io/tianjian518/opsync)（**多架构：amd64 + arm64，
+Apple Silicon / ARM 服务器 / 部分 HF Space 均可直接运行**），Space 里无需放任何代码。
+容器启动后监听 `$PORT`（默认 7860），打开 Space 页面即是管理界面。
 
 ## 工作原理
 
@@ -46,7 +47,7 @@ Space 里无需放任何代码。容器启动后监听 `$PORT`（默认 7860）�
 docker run --rm -p 7860:7860 \
   -e OPSYNC_URL=https://你的openlist \
   -e OPSYNC_USERNAME=admin -e OPSYNC_PASSWORD=你的密码 \
-  docker.io/tianjian518/opsync:latest
+  ghcr.io/tianjian518/opsync:latest
 # 然后浏览器打开 http://127.0.0.1:7860
 ```
 
