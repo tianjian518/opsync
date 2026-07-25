@@ -1,4 +1,4 @@
-# taosync-lite
+# opsync
 
 通过 **OpenList（AList v3 兼容）** 把一个网盘里的东西**定时搬运**到另一个网盘的极简工具。
 
@@ -88,8 +88,8 @@ CMD ["python", "main.py"]
 ```
 
 ```bash
-docker build -t taosync-lite .
-docker run -d -v $(pwd)/config.toml:/app/config.toml taosync-lite
+docker build -t opsync .
+docker run -d -v $(pwd)/config.toml:/app/config.toml opsync
 ```
 
 ## 说明

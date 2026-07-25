@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""taosync-lite —— 通过 OpenList 把网盘 A 定时搬到网盘 B 的极简工具。
+"""opsync —— 通过 OpenList 把网盘 A 定时搬到网盘 B 的极简工具。
 
 用法：
   python main.py                 # 按配置持续运行（schedule）
@@ -28,7 +28,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("taosync")
+logger = logging.getLogger("opsync")
 
 
 def load_config(path: str) -> dict:

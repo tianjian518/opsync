@@ -1,4 +1,4 @@
-# taosync-lite 配置文件
+# opsync 配置文件
 # 最常见的用法：一个 OpenList 里同时挂了两个网盘，把 A 搬到 B。
 
 [source]
@@ -26,4 +26,4 @@ interval_minutes = 30       # interval 模式：每 30 分钟跑一次
 
 [logging]
 level = "INFO"              # DEBUG / INFO / WARNING / ERROR
-file = "taosync.log"        # 日志文件路径，留空 "" 则不写文件
+file = "opsync.log"        # 日志文件路径，留空 "" 则不写文件
