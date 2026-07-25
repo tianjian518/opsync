@@ -1,29 +1,49 @@
-"""配置加载与合并（CLI 与 Web 共用）。
+"""配置加载与序列化（CLI 与 Web 共用）。
 
-新模型：
-  [openlist]  单一 OpenList 连接（同一实例里不同网盘之间搬运）
-  [[routes]]  多条搬运路线，每条有 src_path / dst_path / mode / schedule
+新模型：支持「多个 OpenList 账号」，每个账号下挂若干搬运路线。
+
+    [[openlists]]
+    id = "conn-xxxx"            # 唯一标识
+    name = "账号1"              # 展示名
+    url = "https://x.hf.space"  # OpenList 地址
+    username = "admin"
+    password = "12345"
+    tested_ok = true            # 最近一次连接测试是否通过
+
+        [[openlists.routes]]
+        name = "路线1"
+        src_path = "/源目录"
+        dst_path = "/目标目录"
+        mode = "copy"           # copy / move
+        enabled = true
+        overwrite = false
+        delete_empty_dirs = false
+        schedule_type = "interval"   # interval / daily / once
+        interval_minutes = 30
+        run_at = "03:00"
+
+登录信息会持久化到 /data/config.toml（抱脸等平台的持久化目录），刷新不丢失。
 """
 
 import os
 import tomllib
 
 
-def _as_bool(v: str) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-
 def apply_env(cfg: dict) -> None:
-    """用 TAOSYNC_* 环境变量覆盖 OpenList 连接（路线仍建议用网页配置）。"""
+    """用 TAOSYNC_* 环境变量覆盖「第一个」OpenList 账号（多账号时仅作用于首个）。"""
     m = {
-        "TAOSYNC_URL": ("openlist", "url"),
-        "TAOSYNC_USERNAME": ("openlist", "username"),
-        "TAOSYNC_PASSWORD": ("openlist", "password"),
+        "TAOSYNC_URL": "url",
+        "TAOSYNC_USERNAME": "username",
+        "TAOSYNC_PASSWORD": "password",
     }
-    for env, (sec, key) in m.items():
-        if env not in os.environ:
-            continue
-        cfg.setdefault(sec, {})[key] = os.environ[env]
+    kv = {key: m[env] for env in m if env in os.environ}
+    if not kv:
+        return
+    cfg.setdefault("openlists", [])
+    if cfg["openlists"]:
+        cfg["openlists"][0].update(kv)
+    else:
+        cfg["openlists"].append({"id": "env", "name": "env", **kv})
 
 
 def resolve_config_path() -> str:
@@ -42,11 +62,53 @@ def save_path() -> str:
 
 
 def load_config():
-    """返回 (config, path)。"""
+    """返回 (config, path)。配置缺失时返回空结构而非崩溃。"""
     path = resolve_config_path()
-    with open(path, "rb") as f:
-        cfg = tomllib.load(f)
-    if "openlist" not in cfg:
-        raise SystemExit("配置文件缺少必填段：[openlist]")
+    try:
+        with open(path, "rb") as f:
+            cfg = tomllib.load(f)
+    except FileNotFoundError:
+        cfg = {}
+    cfg.setdefault("openlists", [])
     apply_env(cfg)
     return cfg, path
+
+
+# ------------------------------------------------------------------ TOML 序列化
+def _toml_scalar(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = "" if v is None else str(v)
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _emit_table(out: list, path: str, d: dict) -> None:
+    # 1) 标量（非表、非表数组）先写；空列表/表数组均跳过，留待第 3 步或省略
+    for k, v in d.items():
+        if isinstance(v, (dict, list)):
+            continue
+        out.append(f"{k} = {_toml_scalar(v)}")
+    # 2) 子表
+    for k, v in d.items():
+        if isinstance(v, dict) and v:
+            sub = f"{path}.{k}" if path else k
+            out.append(f"[{sub}]")
+            _emit_table(out, sub, v)
+            out.append("")
+    # 3) 表数组（含嵌套，如 openlists.routes）
+    for k, v in d.items():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            sub = f"{path}.{k}" if path else k
+            for item in v:
+                out.append(f"[[{sub}]]")
+                _emit_table(out, sub, item)
+                out.append("")
+
+
+def write_toml(path: str, cfg: dict) -> None:
+    out: list[str] = []
+    _emit_table(out, "", cfg)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out).rstrip("\n") + "\n")
