@@ -1,4 +1,9 @@
-"""配置加载与合并（供 CLI 与 Web 共用）。"""
+"""配置加载与合并（CLI 与 Web 共用）。
+
+新模型：
+  [openlist]  单一 OpenList 连接（同一实例里不同网盘之间搬运）
+  [[routes]]  多条搬运路线，每条有 src_path / dst_path / mode / schedule
+"""
 
 import os
 import tomllib
@@ -9,38 +14,16 @@ def _as_bool(v: str) -> bool:
 
 
 def apply_env(cfg: dict) -> None:
-    """用 TAOSYNC_* 环境变量覆盖配置。"""
+    """用 TAOSYNC_* 环境变量覆盖 OpenList 连接（路线仍建议用网页配置）。"""
     m = {
-        "TAOSYNC_SOURCE_URL": ("source", "url"),
-        "TAOSYNC_SOURCE_USERNAME": ("source", "username"),
-        "TAOSYNC_SOURCE_PASSWORD": ("source", "password"),
-        "TAOSYNC_SOURCE_PATH": ("source", "path"),
-        "TAOSYNC_TARGET_URL": ("target", "url"),
-        "TAOSYNC_TARGET_USERNAME": ("target", "username"),
-        "TAOSYNC_TARGET_PASSWORD": ("target", "password"),
-        "TAOSYNC_TARGET_PATH": ("target", "path"),
-        "TAOSYNC_MODE": ("transfer", "mode"),
-        "TAOSYNC_OVERWRITE": ("transfer", "overwrite"),
-        "TAOSYNC_CONCURRENCY": ("transfer", "concurrency"),
-        "TAOSYNC_DELETE_EMPTY_DIRS": ("transfer", "delete_empty_dirs"),
-        "TAOSYNC_SCHEDULE_TYPE": ("schedule", "type"),
-        "TAOSYNC_INTERVAL_MINUTES": ("schedule", "interval_minutes"),
-        "TAOSYNC_RUN_AT": ("schedule", "run_at"),
-        "TAOSYNC_LOG_LEVEL": ("logging", "level"),
-        "TAOSYNC_LOG_FILE": ("logging", "file"),
+        "TAOSYNC_URL": ("openlist", "url"),
+        "TAOSYNC_USERNAME": ("openlist", "username"),
+        "TAOSYNC_PASSWORD": ("openlist", "password"),
     }
     for env, (sec, key) in m.items():
         if env not in os.environ:
             continue
-        val = os.environ[env]
-        if key in ("overwrite", "delete_empty_dirs"):
-            val = _as_bool(val)
-        elif key in ("concurrency", "interval_minutes"):
-            try:
-                val = float(val) if key == "interval_minutes" else int(val)
-            except ValueError:
-                continue
-        cfg.setdefault(sec, {})[key] = val
+        cfg.setdefault(sec, {})[key] = os.environ[env]
 
 
 def resolve_config_path() -> str:
@@ -63,10 +46,7 @@ def load_config():
     path = resolve_config_path()
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
-    for key in ("source", "target"):
-        if key not in cfg:
-            raise SystemExit(f"配置文件缺少必填段：[{key}]")
-    if "path" not in cfg["source"] or "path" not in cfg["target"]:
-        raise SystemExit("source / target 都必须包含 path 字段")
+    if "openlist" not in cfg:
+        raise SystemExit("配置文件缺少必填段：[openlist]")
     apply_env(cfg)
     return cfg, path

@@ -1,8 +1,8 @@
-"""opsync 的 Web 管理界面 + 后台调度器。
+"""opsync 的 Web 管理界面 + 后台调度器（多路线）。
 
-- 容器监听 $PORT（抱脸会注入，默认 7860），提供浏览器配置/触发/看日志。
-- 后台线程按 schedule 定时跑；配置未填好时安静待命，绝不抛异常崩容器。
-- 配置持久化到 /data/config.toml（抱脸持久化目录），否则写本地 config.toml。
+流程：填 OpenList 账号密码 → 保存并连接测试 → 测试通过后浏览选择源/目标目录 →
+建立多条搬运路线 → 调度器按各自设置自动跑。容器监听 $PORT（抱脸注入，默认 7860）。
+配置保存在 /data/config.toml（持久化）。
 """
 
 import datetime
@@ -10,16 +10,22 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, jsonify, request
 from confighelper import load_config, save_path
+from openlist_client import OpenListClient
 from sync import SyncEngine
 
 app = Flask(__name__)
 PORT = int(os.environ.get("PORT", 7860))
 
-_state = {"running": False, "last_run": None, "last_stats": None, "last_error": None}
-_state_lock = threading.Lock()
+_state = {"running": False, "last_run": None, "last_error": None}
+_route_results = {}
+_running = set()
+_running_lock = threading.Lock()
+_next = {}
+_exec = ThreadPoolExecutor(max_workers=4)
 _log_lock = threading.Lock()
 _log_lines: list[str] = []
 
@@ -39,77 +45,116 @@ logging.getLogger().addHandler(_bh)
 _log = logging.getLogger("opsync")
 
 
-def is_configured(cfg: dict) -> bool:
-    """配置是否已填好（避免拿着占位值去连 127.0.0.1 导致崩溃）。"""
-    for side in ("source", "target"):
-        s = cfg.get(side, {})
-        if not s.get("url") or not s.get("path"):
-            return False
-        if s.get("password") in (None, "", "your_password"):
-            return False
-        if "127.0.0.1" in str(s.get("url", "")):
-            return False
+def is_configured(ol: dict) -> bool:
+    if not isinstance(ol, dict):
+        return False
+    if not ol.get("url") or not ol.get("username"):
+        return False
+    if ol.get("password") in (None, "", "your_password"):
+        return False
+    if "127.0.0.1" in str(ol.get("url", "")):
+        return False
     return True
 
 
-def do_run() -> bool:
-    """执行一次同步（带锁，保证同一时间只有一次在跑）。返回是否成功启动。"""
-    with _state_lock:
-        if _state["running"]:
-            return False
-        _state["running"] = True
+def _now_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def run_route_safe(ol: dict, r: dict) -> None:
+    name = r.get("name") or "?"
+    with _running_lock:
+        if name in _running:
+            return
+        _running.add(name)
     try:
-        cfg, _ = load_config()
-        stats = SyncEngine(cfg).run_once()
-        _state["last_stats"] = stats
-        _state["last_error"] = None
+        stats = SyncEngine(ol).run_route(r)
+        _route_results[name] = {"last_run": _now_str(), "stats": stats, "error": None}
     except Exception:
-        _log.exception("同步失败")
-        _state["last_error"] = "同步出错，详见日志"
+        _log.exception("路线[%s] 执行失败", name)
+        _route_results[name] = {"last_run": _now_str(), "stats": None, "error": "执行出错，详见日志"}
     finally:
-        _state["last_run"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with _state_lock:
-            _state["running"] = False
-    return True
+        with _running_lock:
+            _running.discard(name)
+        with _running_lock:
+            _state["running"] = bool(_running)
+
+
+def compute_next(r: dict, now: datetime.datetime):
+    st = r.get("schedule_type", "interval")
+    if st == "once":
+        return now + datetime.timedelta(days=365)
+    if st == "daily":
+        run_at = str(r.get("run_at", "03:00"))
+        hh, mm = (int(x) for x in run_at.split(":"))
+        nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += datetime.timedelta(days=1)
+        return nxt
+    mins = float(r.get("interval_minutes", 30))
+    return now + datetime.timedelta(minutes=mins)
 
 
 def scheduler_loop() -> None:
     while True:
         try:
             cfg, _ = load_config()
-            if not is_configured(cfg):
-                _log.info("配置未完成（请在网页填写 OpenList 地址/账号/目录），调度暂停。")
-                time.sleep(60)
+            ol = cfg.get("openlist")
+            if not is_configured(ol):
+                _log.info("OpenList 连接未配置（请在网页填写并测试），调度暂停。")
+                time.sleep(30)
                 continue
-            sched = cfg.get("schedule", {})
-            mode = sched.get("type", "interval")
-            if mode == "once":
-                do_run()
-                while True:
-                    time.sleep(3600)
-            elif mode == "daily":
-                run_at = str(sched.get("run_at", "03:00"))
-                hh, mm = (int(x) for x in run_at.split(":"))
-                now = datetime.datetime.now()
-                nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-                if nxt <= now:
-                    nxt += datetime.timedelta(days=1)
-                wait = (nxt - now).total_seconds()
-                _log.info("下次执行：%s", nxt.strftime("%Y-%m-%d %H:%M:%S"))
-                time.sleep(wait)
-                do_run()
-            else:
-                do_run()
-                time.sleep(float(sched.get("interval_minutes", 30)) * 60)
+            now = datetime.datetime.now()
+            for r in cfg.get("routes", []):
+                if not r.get("enabled", True):
+                    continue
+                name = r.get("name") or id(r)
+                nxt = _next.get(name)
+                due = (nxt is None) or (now >= nxt)
+                with _running_lock:
+                    busy = name in _running
+                if due and not busy:
+                    _exec.submit(run_route_safe, ol, r)
+                    _next[name] = compute_next(r, now)
+            time.sleep(15)
         except Exception:
             _log.exception("调度异常")
-            time.sleep(60)
+            time.sleep(30)
 
 
 # ------------------------------------------------------------------ 路由
 @app.route("/")
 def index():
     return HTML
+
+
+@app.route("/api/connection-test", methods=["POST"])
+def api_connection_test():
+    d = request.get_json(force=True, silent=True) or {}
+    try:
+        c = OpenListClient(d["url"], d["username"], d["password"])
+        c.login()
+        c.list_files("/")  # 顺带验证能列根目录
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/browse")
+def api_browse():
+    path = request.args.get("path", "/")
+    try:
+        cfg, _ = load_config()
+        ol = cfg.get("openlist", {})
+        if not is_configured(ol):
+            return jsonify({"ok": False, "error": "请先配置并保存 OpenList 连接"})
+        client = OpenListClient(ol["url"], ol["username"], ol["password"])
+        client.login()
+        entries = client.list_files(path)
+        dirs = sorted(e["name"] for e in entries if e["is_dir"])
+        return jsonify({"ok": True, "path": path, "dirs": dirs})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/config", methods=["GET"])
@@ -119,10 +164,8 @@ def api_config_get():
     except Exception:
         cfg = {}
     return jsonify({
-        "source": cfg.get("source", {}),
-        "target": cfg.get("target", {}),
-        "transfer": cfg.get("transfer", {}),
-        "schedule": cfg.get("schedule", {}),
+        "openlist": cfg.get("openlist", {}),
+        "routes": cfg.get("routes", []),
         "config_path": save_path(),
     })
 
@@ -130,31 +173,44 @@ def api_config_get():
 @app.route("/api/config", methods=["POST"])
 def api_config_post():
     data = request.get_json(force=True, silent=True) or {}
-    cfg = {
-        "source": data.get("source", {}),
-        "target": data.get("target", {}),
-        "transfer": data.get("transfer", {}),
-        "schedule": data.get("schedule", {}),
-        "logging": {"level": "INFO", "file": ""},
-    }
-    for side in ("source", "target"):
-        if not cfg[side].get("url") or not cfg[side].get("path"):
-            return jsonify({"ok": False, "error": f"{side} 需要填写 url 与 path"}), 400
+    ol = data.get("openlist", {})
+    if not ol.get("url") or not ol.get("username") or not ol.get("password"):
+        return jsonify({"ok": False, "error": "OpenList 需要 url / username / password"}), 400
+    routes = data.get("routes", [])
     path = save_path()
-    write_toml(path, cfg)
+    write_toml(path, {"openlist": ol, "routes": routes})
     return jsonify({"ok": True, "path": path})
 
 
 @app.route("/api/run", methods=["POST"])
 def api_run():
-    if do_run():
-        return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": "正在运行中，请稍候"})
+    data = request.get_json(force=True, silent=True) or {}
+    name = data.get("name")
+    try:
+        cfg, _ = load_config()
+        ol = cfg.get("openlist")
+        if not is_configured(ol):
+            return jsonify({"ok": False, "error": "未配置 OpenList 连接"})
+        targets = [r for r in cfg.get("routes", [])
+                   if r.get("enabled", True) and (name is None or r.get("name") == name)]
+        started = 0
+        for r in targets:
+            with _running_lock:
+                busy = r.get("name") in _running
+            if not busy:
+                _exec.submit(run_route_safe, ol, r)
+                started += 1
+        return jsonify({"ok": True, "started": started})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/status")
 def api_status():
-    return jsonify(_state)
+    with _running_lock:
+        running = bool(_running)
+    return jsonify({"running": running, "last_run": _state["last_run"],
+                    "last_error": _state["last_error"], "routes": _route_results})
 
 
 @app.route("/api/logs")
@@ -165,21 +221,39 @@ def api_logs():
     return jsonify({"logs": "\n".join(lines)})
 
 
-# ------------------------------------------------------------------ 工具
+# ------------------------------------------------------------------ TOML 序列化
+def _toml_scalar(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return '"' + str(v).replace('"', '\\"') + '"'
+
+
+def _toml_kv(k, v):
+    return f"{k} = {_toml_scalar(v)}"
+
+
 def write_toml(path: str, cfg: dict) -> None:
     out = []
-    for sec, kv in cfg.items():
-        if not isinstance(kv, dict):
-            continue
-        out.append(f"[{sec}]")
-        for k, v in kv.items():
-            if isinstance(v, bool):
-                out.append(f"{k} = {'true' if v else 'false'}")
-            elif isinstance(v, (int, float)):
-                out.append(f"{k} = {v}")
-            else:
-                out.append(f'{k} = "{str(v).replace(chr(34), chr(92) + chr(34))}"')
-        out.append("")
+    for key, val in cfg.items():
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    out.append(f"[[{key}]]")
+                    for k, v in item.items():
+                        out.append(_toml_kv(k, v))
+                    out.append("")
+                else:
+                    out.append(f"{key} = {_toml_scalar(item)}")
+        elif isinstance(val, dict):
+            out.append(f"[{key}]")
+            for k, v in val.items():
+                out.append(_toml_kv(k, v))
+            out.append("")
+        else:
+            out.append(_toml_kv(key, val))
+    out.append("")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out))
 
@@ -191,135 +265,216 @@ HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>opsync · 网盘定时搬运</title>
 <style>
-  :root { --bg:#0f172a; --card:#1e293b; --fg:#e2e8f0; --mut:#94a3b8; --acc:#38bdf8; --ok:#34d399; --err:#f87171; }
-  * { box-sizing: border-box; }
+  :root { --bg:#0f172a; --card:#1e293b; --fg:#e2e8f0; --mut:#94a3b8; --acc:#38bdf8; --ok:#34d399; --err:#f87171; --bd:#334155; }
+  * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,Segoe UI,Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
-  .wrap { max-width:960px; margin:0 auto; padding:24px 16px 60px; }
+  .wrap { max-width:1000px; margin:0 auto; padding:24px 16px 60px; }
   h1 { margin:0 0 4px; font-size:22px; }
   .sub { color:var(--mut); margin:0 0 20px; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-  @media (max-width:720px){ .grid { grid-template-columns:1fr; } }
-  section { background:var(--card); border-radius:12px; padding:16px; }
+  section { background:var(--card); border-radius:12px; padding:16px; margin-bottom:16px; }
   h2 { margin:0 0 12px; font-size:15px; color:var(--acc); }
   label { display:block; margin:8px 0 4px; color:var(--mut); font-size:12px; }
-  input, select { width:100%; padding:8px 10px; border-radius:8px; border:1px solid #334155; background:#0b1220; color:var(--fg); }
+  input, select { width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--bd); background:#0b1220; color:var(--fg); }
   .row { display:flex; gap:10px; }
   .row > div { flex:1; }
-  .actions { margin:18px 0; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  button { cursor:pointer; border:0; border-radius:8px; padding:10px 16px; font-weight:600; }
-  #save { background:var(--acc); color:#06283d; }
-  #run { background:var(--ok); color:#053b2c; }
+  button { cursor:pointer; border:0; border-radius:8px; padding:9px 14px; font-weight:600; background:var(--acc); color:#06283d; }
+  button.ghost { background:#0b1220; color:var(--fg); border:1px solid var(--bd); }
+  button.ok { background:var(--ok); color:#053b2c; }
+  button.danger { background:#3f1d1d; color:#fca5a5; border:1px solid #7f1d1d; }
+  .actions { margin:14px 0; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   #msg { color:var(--mut); }
-  .status { background:var(--card); border-radius:10px; padding:12px 14px; margin-bottom:14px; }
-  pre { background:#0b1220; border:1px solid #334155; border-radius:10px; padding:14px; max-height:360px; overflow:auto; white-space:pre-wrap; word-break:break-all; color:#cbd5e1; }
-  .hint { color:var(--mut); font-size:12px; margin-top:6px; }
+  .route { border:1px solid var(--bd); border-radius:10px; padding:12px; margin-bottom:12px; background:#172033; }
+  .route h3 { margin:0 0 10px; font-size:14px; display:flex; justify-content:space-between; align-items:center; }
+  .status { background:var(--card); border-radius:10px; padding:12px 14px; margin-bottom:14px; font-size:13px; }
+  pre { background:#0b1220; border:1px solid var(--bd); border-radius:10px; padding:14px; max-height:340px; overflow:auto; white-space:pre-wrap; word-break:break-all; color:#cbd5e1; }
+  .hint { color:var(--mut); font-size:12px; }
+  /* 目录选择器 */
+  #picker { position:fixed; inset:0; background:rgba(2,6,23,.7); display:none; align-items:center; justify-content:center; z-index:50; }
+  #picker .box { width:min(560px,92vw); background:var(--card); border-radius:12px; padding:16px; }
+  #pickerPath { color:var(--acc); margin:8px 0; word-break:break-all; }
+  #pickerList { max-height:320px; overflow:auto; }
+  #pickerList div { padding:8px 10px; border-radius:8px; cursor:pointer; }
+  #pickerList div:hover { background:#0b1220; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>opsync</h1>
-  <p class="sub">通过 OpenList 把网盘 A 定时搬运到网盘 B</p>
+  <p class="sub">同一个 OpenList 里，把网盘 A 定时搬运到网盘 B · 可建多条路线</p>
 
-  <div class="grid">
-    <section>
-      <h2>源 OpenList</h2>
-      <label>地址 URL</label><input id="source_url" placeholder="http://127.0.0.1:5244">
-      <label>账号</label><input id="source_username" placeholder="admin">
-      <label>密码</label><input id="source_password" type="password" placeholder="密码">
-      <label>目录路径</label><input id="source_path" placeholder="/阿里云盘/照片">
-    </section>
-    <section>
-      <h2>目标 OpenList</h2>
-      <label>地址 URL</label><input id="target_url" placeholder="http://127.0.0.1:5244">
-      <label>账号</label><input id="target_username" placeholder="admin">
-      <label>密码</label><input id="target_password" type="password" placeholder="密码">
-      <label>目录路径</label><input id="target_path" placeholder="/OneDrive/备份/照片">
-    </section>
-    <section>
-      <h2>搬运设置</h2>
-      <label>模式</label>
-      <select id="mode"><option value="copy">copy（复制，保留源）</option><option value="move">move（搬完删源）</option></select>
-      <div class="row">
-        <div><label>并发数</label><input id="concurrency" type="number" value="3" min="1"></div>
-        <div><label>调度间隔(分钟)</label><input id="interval_minutes" type="number" value="30" min="1"></div>
-      </div>
-      <label class="hint"><input type="checkbox" id="overwrite"> 强制覆盖（同名且大小一致也重传）</label>
-      <label class="hint"><input type="checkbox" id="delete_empty_dirs"> move 后删除已搬空的源目录</label>
-    </section>
-    <section>
-      <h2>调度</h2>
-      <label>类型</label>
-      <select id="schedule_type">
-        <option value="interval">interval（每 N 分钟）</option>
-        <option value="daily">daily（每天定时）</option>
-        <option value="once">once（仅手动/启动时一次）</option>
-      </select>
-      <label>daily 执行时间</label><input id="run_at" value="03:00" placeholder="HH:MM">
-      <p class="hint">保存后调度器按此设置自动运行；也可点“立即运行一次”手动触发。</p>
-    </section>
-  </div>
+  <section>
+    <h2>1. OpenList 连接</h2>
+    <label>OpenList 地址</label><input id="url" placeholder="http://127.0.0.1:5244">
+    <div class="row">
+      <div><label>账号</label><input id="username" placeholder="admin"></div>
+      <div><label>密码</label><input id="password" type="password" placeholder="密码"></div>
+    </div>
+    <div class="actions">
+      <button id="saveConn">保存并连接测试</button>
+      <button class="ghost" id="testConn">仅测试连接</button>
+      <span id="connMsg"></span>
+    </div>
+  </section>
 
-  <div class="actions">
-    <button id="save">保存配置</button>
-    <button id="run">立即运行一次</button>
-    <span id="msg"></span>
-  </div>
+  <section id="routesSection" style="display:none">
+    <h2>2. 搬运路线</h2>
+    <div id="routes"></div>
+    <div class="actions">
+      <button class="ghost" id="addRoute">+ 添加路线</button>
+      <button id="saveRoutes">保存路线</button>
+      <button class="ok" id="runAll">立即运行全部</button>
+      <span id="msg"></span>
+    </div>
+  </section>
 
   <div class="status" id="status">加载中…</div>
-
   <h2>日志</h2>
   <pre id="logs"></pre>
+</div>
+
+<div id="picker">
+  <div class="box">
+    <h2>选择目录</h2>
+    <div id="pickerPath">/</div>
+    <div id="pickerList"></div>
+    <div class="actions">
+      <button class="ghost" id="pickerUp">上一级</button>
+      <button class="ghost" id="pickerCancel">取消</button>
+      <button id="pickerOk">选择此目录</button>
+    </div>
+  </div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
 const gv = id => $(id).value;
 function setv(id,v){ if(v!==undefined&&v!==null) $(id).value=v; }
-function setc(id,v){ $(id).checked = !!v; }
+
+let openlist = {};
+let routes = [];
+let picker = { idx:0, field:"src_path", path:"/" };
 
 async function load(){
   try{
     const c = await (await fetch('/api/config')).json();
-    setv('source_url',c.source?.url); setv('source_username',c.source?.username);
-    setv('source_password',c.source?.password); setv('source_path',c.source?.path);
-    setv('target_url',c.target?.url); setv('target_username',c.target?.username);
-    setv('target_password',c.target?.password); setv('target_path',c.target?.path);
-    setv('mode',c.transfer?.mode||'copy'); setv('concurrency',c.transfer?.concurrency??3);
-    setc('overwrite',c.transfer?.overwrite); setc('delete_empty_dirs',c.transfer?.delete_empty_dirs);
-    setv('schedule_type',c.schedule?.type||'interval'); setv('interval_minutes',c.schedule?.interval_minutes??30);
-    setv('run_at',c.schedule?.run_at||'03:00');
+    openlist = c.openlist || {};
+    routes = c.routes || [];
+    setv('url', openlist.url); setv('username', openlist.username); setv('password', openlist.password);
+    updateConnUI();
+    renderRoutes();
   }catch(e){ msg('加载配置失败'); }
 }
-function msg(t){ $('msg').textContent=t; }
+function updateConnUI(){
+  const ok = !!(openlist && openlist.url && openlist.password && openlist.password!=='your_password' && !openlist.url.includes('127.0.0.1'));
+  $('routesSection').style.display = ok ? 'block' : 'none';
+  $('connMsg').textContent = ok ? '✅ 已配置' : '⚠ 请先填写并保存 OpenList 连接';
+}
+function msg(t){ $('msg').textContent = t; }
+function connMsg(t){ $('connMsg').textContent = t; }
 
-async function save(){
-  const data = {
-    source:{url:gv('source_url'),username:gv('source_username'),password:gv('source_password'),path:gv('source_path')},
-    target:{url:gv('target_url'),username:gv('target_username'),password:gv('target_password'),path:gv('target_path')},
-    transfer:{mode:$('mode').value, overwrite:$('overwrite').checked, concurrency:Number(gv('concurrency')), delete_empty_dirs:$('delete_empty_dirs').checked},
-    schedule:{type:$('schedule_type').value, interval_minutes:Number(gv('interval_minutes')), run_at:gv('run_at')}
-  };
-  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  const j = await r.json();
-  msg(j.ok ? ('已保存：'+j.path) : ('保存失败：'+j.error));
+async function doTest(data){
+  const r = await fetch('/api/connection-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  return await r.json();
 }
-async function runnow(){
-  const r = await fetch('/api/run',{method:'POST'});
-  const j = await r.json();
-  msg(j.ok ? '已开始同步' : '忙碌中：'+j.error);
+$('testConn').onclick = async () => {
+  connMsg('测试中…');
+  const j = await doTest({url:gv('url'),username:gv('username'),password:gv('password')});
+  connMsg(j.ok ? '✅ 连接成功' : ('❌ '+j.error));
+};
+$('saveConn').onclick = async () => {
+  connMsg('测试中…');
+  const data = {url:gv('url'),username:gv('username'),password:gv('password')};
+  const j = await doTest(data);
+  if(!j.ok){ connMsg('❌ 连接失败：'+j.error); return; }
+  openlist = data;
+  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({openlist:data, routes:routes})});
+  const c = await r.json();
+  connMsg(c.ok ? '✅ 连接成功并已保存' : ('❌ 保存失败：'+c.error));
+  updateConnUI();
+};
+
+function addRoute(){
+  routes.push({name:'路线'+(routes.length+1), src_path:'', dst_path:'', mode:'copy', enabled:true, overwrite:false, concurrency:3, delete_empty_dirs:false, schedule_type:'interval', interval_minutes:30, run_at:'03:00'});
+  renderRoutes();
+}
+$('addRoute').onclick = addRoute;
+
+function delRoute(i){ routes.splice(i,1); renderRoutes(); }
+function runOne(i){ const r=routes[i]; if(!r||!r.name) return; fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:r.name})}); msg('已触发：'+r.name); poll(); }
+
+function renderRoutes(){
+  const w = $('routes'); w.innerHTML='';
+  routes.forEach((r,i)=>{
+    const d = document.createElement('div'); d.className='route';
+    const en = r.enabled?'checked':'';
+    d.innerHTML =
+      '<h3><span>路线 '+(i+1)+'</span>'+
+      '<span><button class="ghost" data-act="run">运行</button> <button class="danger" data-act="del">删除</button></span></h3>'+
+      '<label>名称</label><input data-f="name" value="'+(r.name||'')+'">'+
+      '<div class="row"><div><label>源目录</label><input data-f="src_path" value="'+(r.src_path||'')+'"></div>'+
+      '<div><button class="ghost" data-act="pick_src">浏览选择</button></div></div>'+
+      '<div class="row"><div><label>目标目录</label><input data-f="dst_path" value="'+(r.dst_path||'')+'"></div>'+
+      '<div><button class="ghost" data-act="pick_dst">浏览选择</button></div></div>'+
+      '<div class="row"><div><label>模式</label><select data-f="mode"><option value="copy"'+(r.mode==='copy'?' selected':'')+'>copy 复制保留源</option><option value="move"'+(r.mode==='move'?' selected':'')+'>move 搬完删源</option></select></div>'+
+      '<div><label>调度</label><select data-f="schedule_type"><option value="interval"'+(r.schedule_type==='interval'?' selected':'')+'>interval 每N分钟</option><option value="daily"'+(r.schedule_type==='daily'?' selected':'')+'>daily 每天</option><option value="once"'+(r.schedule_type==='once'?' selected':'')+'>once 仅手动</option></select></div></div>'+
+      '<div class="row"><div><label>间隔(分钟)</label><input data-f="interval_minutes" value="'+(r.interval_minutes||30)+'" type="number" min="1"></div>'+
+      '<div><label>daily 时间</label><input data-f="run_at" value="'+(r.run_at||'03:00')+'"></div></div>'+
+      '<label class="hint"><input type="checkbox" data-f="enabled" '+en+'> 启用　'+
+      '<input type="checkbox" data-f="overwrite" '+(r.overwrite?'checked':'')+'> 强制覆盖　'+
+      '<input type="checkbox" data-f="delete_empty_dirs" '+(r.delete_empty_dirs?'checked':'')+'> move删空目录</label>';
+    d.querySelectorAll('[data-f]').forEach(el=>{
+      el.addEventListener('input', ()=>{ r[el.dataset.f] = el.type==='checkbox' ? el.checked : el.value; });
+      el.addEventListener('change', ()=>{ r[el.dataset.f] = el.type==='checkbox' ? el.checked : el.value; });
+    });
+    d.querySelector('[data-act="del"]').onclick = ()=>delRoute(i);
+    d.querySelector('[data-act="run"]').onclick = ()=>runOne(i);
+    d.querySelector('[data-act="pick_src"]').onclick = ()=>openPicker(i,'src_path');
+    d.querySelector('[data-act="pick_dst"]').onclick = ()=>openPicker(i,'dst_path');
+    w.appendChild(d);
+  });
+}
+$('saveRoutes').onclick = async () => {
+  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({openlist:openlist, routes:routes})});
+  const c = await r.json();
+  msg(c.ok ? '路线已保存' : '保存失败：'+c.error);
+};
+$('runAll').onclick = async () => {
+  const r = await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+  const c = await r.json();
+  msg(c.ok ? ('已触发 '+c.started+' 条路线') : '触发失败：'+c.error);
   poll();
+};
+
+// ---- 目录选择器 ----
+function openPicker(i, field){ picker={idx:i, field:field, path:'/'}; $('picker').style.display='flex'; renderPicker(); }
+async function renderPicker(){
+  $('pickerPath').textContent = picker.path;
+  const r = await (await fetch('/api/browse?path='+encodeURIComponent(picker.path))).json();
+  const list = $('pickerList'); list.innerHTML='';
+  if(!r.ok){ list.innerHTML='<div>'+r.error+'</div>'; return; }
+  if(r.dirs.length===0){ list.innerHTML='<div class="hint">（此目录没有子目录）</div>'; return; }
+  r.dirs.forEach(name=>{
+    const el = document.createElement('div'); el.textContent='📁 '+name;
+    el.onclick = ()=>{ picker.path = (picker.path==='/'?'/':'/'+picker.path.replace(/^\//,'')) ; picker.path = picker.path.replace(/\/$/,'')+'/'+name; renderPicker(); };
+    list.appendChild(el);
+  });
 }
+$('pickerUp').onclick = ()=>{ if(picker.path==='/') return; const p=picker.path.replace(/\/$/,''); picker.path = p.includes('/')? p.slice(0,p.lastIndexOf('/'))||'/' : '/'; renderPicker(); };
+$('pickerCancel').onclick = ()=>{ $('picker').style.display='none'; };
+$('pickerOk').onclick = ()=>{ const r=routes[picker.idx]; if(r){ r[picker.field]=picker.path; } $('picker').style.display='none'; renderRoutes(); };
+
+// ---- 状态/日志轮询 ----
 async function poll(){
   try{
     const s = await (await fetch('/api/status')).json();
-    $('status').textContent = (s.running?'● 运行中…':'○ 空闲') + '　上次运行：' + (s.last_run||'-') + (s.last_error?('　⚠ '+s.last_error):'');
+    let txt = (s.running?'● 有路线运行中…':'○ 空闲') + '　全局上次：' + (s.last_run||'-');
+    const names = Object.keys(s.routes||{});
+    if(names.length){ txt += '\\n各路线：'; names.forEach(n=>{ const x=s.routes[n]; txt += '\\n  · '+n+'：'+(x.last_run||'-')+(x.error?' ⚠'+x.error:(x.stats?(' 已搬'+x.stats.copied+'/跳'+x.stats.skipped+'/失败'+x.stats.failed):'')); }); }
+    $('status').textContent = txt;
     const l = await (await fetch('/api/logs?n=300')).json();
     $('logs').textContent = l.logs || '(暂无日志)';
   }catch(e){}
 }
-
-$('save').onclick = save;
-$('run').onclick = runnow;
 setInterval(poll, 3000);
 load(); poll();
 </script>

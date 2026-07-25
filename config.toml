@@ -1,29 +1,25 @@
-# opsync 配置文件
-# 最常见的用法：一个 OpenList 里同时挂了两个网盘，把 A 搬到 B。
+# opsync 配置文件（新模型：单个 OpenList + 多条搬运路线）
+# 最常见用法：一个 OpenList 里挂了多个网盘，把网盘 A 定时搬到网盘 B。
 
-[source]
+[openlist]
 url = "http://127.0.0.1:5244"   # OpenList 地址
-username = "admin"              # 管理员/账号
-password = "your_password"     # 密码
-path = "/阿里云盘/照片"          # 源目录（OpenList 里的虚拟路径）
+username = "admin"              # 账号
+password = "your_password"     # 密码（占位，请在网页里填写并连接测试；127.0.0.1 不会被自动调度）
 
-[target]
-url = "http://127.0.0.1:5244"   # 目标实例；与 source 相同即「同实例」，走服务端复制
-username = "admin"
-password = "your_password"
-path = "/OneDrive/备份/照片"     # 目标目录
-
-[transfer]
-mode = "copy"               # copy = 复制保留源；move = 搬完删源
-overwrite = false           # false = 同名且大小一致就跳过；true = 强制覆盖
-concurrency = 3             # 跨实例搬运时的并发数
-delete_empty_dirs = false   # move 模式下是否删掉已搬空的源目录
-
-[schedule]
-type = "interval"           # interval = 每 N 分钟；daily = 每天定时；once = 只跑一次
-interval_minutes = 30       # interval 模式：每 30 分钟跑一次
-# run_at = "03:00"          # daily 模式：每天 03:00 执行
+# 每条路线把 src_path 定时搬（复制/移动）到 dst_path。
+# 下面是一段示例（已注释），真正配置请在网页里「浏览选择」源/目标目录并保存。
+# [[routes]]
+# name = "路线1"
+# src_path = "/阿里云盘/照片"          # 源目录（OpenList 虚拟路径，网页里可浏览选择）
+# dst_path = "/OneDrive/备份/照片"     # 目标目录
+# mode = "copy"                       # copy = 复制保留源；move = 搬完删源
+# enabled = true                      # 是否启用
+# overwrite = false                   # false = 同名且大小一致就跳过；true = 强制覆盖
+# delete_empty_dirs = false           # move 模式下是否删掉已搬空的源目录
+# schedule_type = "interval"          # interval = 每 N 分钟；daily = 每天定时；once = 只跑一次
+# interval_minutes = 30               # interval 模式：每 30 分钟跑一次
+# run_at = "03:00"                    # daily 模式：每天 03:00 执行
 
 [logging]
-level = "INFO"              # DEBUG / INFO / WARNING / ERROR
-file = "opsync.log"        # 日志文件路径，留空 "" 则不写文件
+level = "INFO"                # DEBUG / INFO / WARNING / ERROR
+file = "opsync.log"          # 日志文件路径，留空 "" 则不写文件

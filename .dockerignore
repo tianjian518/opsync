@@ -1,5 +1,7 @@
-__pycache__/
+.git
+hf-space
+data
+__pycache__
 *.pyc
 *.log
-.git/
-.gitignore
+Dockerfile.bak
