@@ -57,11 +57,14 @@ interval_minutes = 30       # 每 30 分钟跑一次
 ## 运行
 
 ```bash
-python main.py                 # 按配置持续定时运行
+python main.py                 # 默认 Web 模式：起浏览器管理界面（监听 $PORT，默认 7860）
 python main.py --once          # 只跑一次（先拿这个验证配置对不对）
 python main.py --check         # 只测试连接、列出源目录内容
 python main.py --config x.toml # 指定配置文件
 ```
+
+Web 模式下打开 `http://<host>:<PORT>` 即可在页面里填写源/目标 OpenList、选择模式与调度、
+手动触发并查看实时日志；配置保存在 `/data/config.toml`（持久化）。
 
 建议第一次先用 `--check` 确认能连上、路径写对，再用 `--once` 跑一次看效果，
 最后再去掉参数常驻运行。
