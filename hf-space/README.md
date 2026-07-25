@@ -37,15 +37,15 @@ Space 里无需放任何代码。容器启动后监听 `$PORT`（默认 7860）�
 6. 页面下方「日志」实时显示同步进度与每条路线最近结果。可再加别的账号，各自独立运行。
 
 > 配置保存在 Space 的持久化目录 `/data/config.toml`，重启不丢。
-> 也可通过 Space 的 **Variables** 注入 `TAOSYNC_URL` / `TAOSYNC_USERNAME` / `TAOSYNC_PASSWORD`
+> 也可通过 Space 的 **Variables** 注入 `OPSYNC_URL` / `OPSYNC_USERNAME` / `OPSYNC_PASSWORD`
 > 覆盖**第一个**账号的连接（优先级高于网页保存的配置）；路线建议在网页里建。
 
 ## 本地调试
 
 ```bash
 docker run --rm -p 7860:7860 \
-  -e TAOSYNC_URL=https://你的openlist \
-  -e TAOSYNC_USERNAME=admin -e TAOSYNC_PASSWORD=你的密码 \
+  -e OPSYNC_URL=https://你的openlist \
+  -e OPSYNC_USERNAME=admin -e OPSYNC_PASSWORD=你的密码 \
   docker.io/tianjian518/opsync:latest
 # 然后浏览器打开 http://127.0.0.1:7860
 ```

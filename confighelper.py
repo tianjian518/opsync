@@ -30,11 +30,11 @@ import tomllib
 
 
 def apply_env(cfg: dict) -> None:
-    """用 TAOSYNC_* 环境变量覆盖「第一个」OpenList 账号（多账号时仅作用于首个）。"""
+    """用 OPSYNC_* 环境变量覆盖「第一个」OpenList 账号（多账号时仅作用于首个）。"""
     m = {
-        "TAOSYNC_URL": "url",
-        "TAOSYNC_USERNAME": "username",
-        "TAOSYNC_PASSWORD": "password",
+        "OPSYNC_URL": "url",
+        "OPSYNC_USERNAME": "username",
+        "OPSYNC_PASSWORD": "password",
     }
     kv = {key: m[env] for env in m if env in os.environ}
     if not kv:

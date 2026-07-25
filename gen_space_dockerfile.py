@@ -26,9 +26,9 @@ parts = [
 for f in files:
     content = (SRC / f).read_text(encoding="utf-8").rstrip("\n")
     parts.append(f"# ---- {f} ----")
-    parts.append("RUN cat > /app/%s <<'TAOSYNC_EOF'" % f)
+    parts.append("RUN cat > /app/%s <<'OPSYNC_EOF'" % f)
     parts.append(content)
-    parts.append("TAOSYNC_EOF")
+    parts.append("OPSYNC_EOF")
     parts.append("")
 
 parts += [
