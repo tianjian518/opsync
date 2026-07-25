@@ -442,8 +442,11 @@ load(); poll();
 
 def run() -> None:
     threading.Thread(target=scheduler_loop, daemon=True).start()
-    _log.info(
-        "opsync Web 已启动：监听端口 %s，架构=%s，Python=%s，配置路径=%s",
-        PORT, platform.machine(), platform.python_version(), save_path(),
+    banner = (
+        f"opsync Web 已启动：监听端口 {PORT}，架构={platform.machine()}，"
+        f"Python={platform.python_version()}，配置路径={save_path()}"
     )
+    # 同时 print 与 log：确保 HF Space 等平台的日志里一定看得到启动信息
+    print(banner, flush=True)
+    _log.info(banner)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
