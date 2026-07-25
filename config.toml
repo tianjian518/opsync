@@ -1,0 +1,29 @@
+# taosync-lite 配置文件
+# 最常见的用法：一个 OpenList 里同时挂了两个网盘，把 A 搬到 B。
+
+[source]
+url = "http://127.0.0.1:5244"   # OpenList 地址
+username = "admin"              # 管理员/账号
+password = "your_password"     # 密码
+path = "/阿里云盘/照片"          # 源目录（OpenList 里的虚拟路径）
+
+[target]
+url = "http://127.0.0.1:5244"   # 目标实例；与 source 相同即「同实例」，走服务端复制
+username = "admin"
+password = "your_password"
+path = "/OneDrive/备份/照片"     # 目标目录
+
+[transfer]
+mode = "copy"               # copy = 复制保留源；move = 搬完删源
+overwrite = false           # false = 同名且大小一致就跳过；true = 强制覆盖
+concurrency = 3             # 跨实例搬运时的并发数
+delete_empty_dirs = false   # move 模式下是否删掉已搬空的源目录
+
+[schedule]
+type = "interval"           # interval = 每 N 分钟；daily = 每天定时；once = 只跑一次
+interval_minutes = 30       # interval 模式：每 30 分钟跑一次
+# run_at = "03:00"          # daily 模式：每天 03:00 执行
+
+[logging]
+level = "INFO"              # DEBUG / INFO / WARNING / ERROR
+file = "taosync.log"        # 日志文件路径，留空 "" 则不写文件
