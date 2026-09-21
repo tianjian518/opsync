@@ -21,6 +21,10 @@
         schedule_type = "interval"   # interval / daily / once
         interval_minutes = 30
         run_at = "03:00"
+        min_size = ""                # 文件大小下限，带单位如 "1GB"；留空 = 不限
+        max_size = "5GB"             # 文件大小上限，带单位如 "5GB"；留空 = 不限
+
+大小筛选的粒度是「单个文件」；范围外的文件一律留在源目录不动（copy 不复制、move 不搬也不删）。
 
 登录信息会持久化到 /data/config.toml（抱脸等平台的持久化目录），刷新不丢失。
 """

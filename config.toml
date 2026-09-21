@@ -21,6 +21,9 @@ tested_ok = false
   # schedule_type = "interval"          # interval = 每 N 分钟；daily = 每天定时；once = 只跑一次
   # interval_minutes = 30               # interval 模式：每 30 分钟跑一次
   # run_at = "03:00"                    # daily 模式：每天 03:00 执行
+  # min_size = ""                       # 文件大小下限，带单位如 "1GB"；留空 = 不限
+  # max_size = "5GB"                    # 文件大小上限，带单位如 "5GB"；留空 = 不限
+  #                                     # 粒度是单个文件；范围外的文件留在源目录不动，不会被删
 
 [logging]
 level = "INFO"                # DEBUG / INFO / WARNING / ERROR

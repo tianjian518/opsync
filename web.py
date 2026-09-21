@@ -373,6 +373,58 @@ function renderPanel(){
   }
 }
 function syncForm(c){ c.name=gv('c_name'); c.url=gv('c_url'); c.username=gv('c_username'); c.password=gv('c_password'); }
+
+function escAttr(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+/* ---- 搬运文件大小范围 ---- */
+// 预设档位：[值, 展示文字]。值为 "min|max"（空 = 不限），"custom" = 自定义。
+const SIZE_PRESETS = [
+  ['|',      '全部（不限制）'],
+  ['|5GB',   '小于 5GB'],
+  ['|1GB',   '小于 1GB'],
+  ['|500MB', '小于 500MB'],
+  ['1GB|',   '大于 1GB'],
+  ['5GB|',   '大于 5GB'],
+  ['1GB|10GB','1GB ~ 10GB'],
+  ['5GB|50GB','5GB ~ 50GB'],
+  ['custom', '自定义…'],
+];
+function sizePreset(v){ return SIZE_PRESETS.find(p=>p[0]===v); }
+function sizeOf(r){ return (r.min_size||'')+'|'+(r.max_size||''); }
+function isCustomSize(r){
+  const v=sizeOf(r);
+  if(v==='|') return false;
+  return !sizePreset(v);
+}
+function sizePresetOptions(r){
+  const v=sizeOf(r);
+  const custom=isCustomSize(r);
+  return SIZE_PRESETS.map(p=>{
+    const sel = (p[0]==='custom'? custom : (!custom && p[0]===v)) ? ' selected':'';
+    return '<option value="'+p[0]+'"'+sel+'>'+p[1]+'</option>';
+  }).join('');
+}
+function sizeCustomText(r){
+  const lo=r.min_size||'', hi=r.max_size||'';
+  if(lo&&hi) return lo+'~'+hi;
+  if(hi) return '小于'+hi;
+  if(lo) return '大于'+lo;
+  return '';
+}
+// 解析自定义输入：支持 "1GB~10GB" / "小于5GB" / "大于1GB" / ">5GB" / "<5GB" / 单填一个数字
+function parseCustomSize(text){
+  let s=String(text||'').trim().replace(/\s+/g,'');
+  if(!s) return {min_size:'',max_size:''};
+  s=s.replace(/^≤|^<=/,'小于').replace(/^≥|^>=/,'大于');
+  let m=s.match(/^(.+?)[~～\-—到至]+(.+)$/);
+  if(m) return {min_size:m[1],max_size:m[2]};
+  m=s.match(/^(小于|不超过|至多|<)(.+)$/);
+  if(m) return {min_size:'',max_size:m[2]};
+  m=s.match(/^(大于|不少于|至少|>)(.+)$/);
+  if(m) return {min_size:m[2],max_size:''};
+  return {min_size:'',max_size:s};   // 只填一个值 → 当作上限
+}
+
 function routeHTML(c,r,i){
   const en=r.enabled?'checked':'';
   return '<div class="route" data-i="'+i+'">'+
@@ -381,7 +433,10 @@ function routeHTML(c,r,i){
     '<div class="row"><div><label>源目录</label><input data-f="src_path" value="'+(r.src_path||'')+'"></div><div><button class="ghost" data-act="pick_src">浏览选择</button></div></div>'+
     '<div class="row"><div><label>目标目录</label><input data-f="dst_path" value="'+(r.dst_path||'')+'"></div><div><button class="ghost" data-act="pick_dst">浏览选择</button></div></div>'+
     '<div class="row"><div><label>模式</label><select data-f="mode"><option value="copy"'+(r.mode==='copy'?' selected':'')+'>copy 复制保留源</option><option value="move"'+(r.mode==='move'?' selected':'')+'>move 搬完删源</option></select></div>'+
-    '<div><label>调度</label><select data-f="schedule_type"><option value="interval"'+(r.schedule_type==='interval'?' selected':'')+'>interval 每N分钟</option><option value="daily"'+(r.schedule_type==='daily'?' selected':'')+'>daily 每天</option><option value="once"'+(r.schedule_type==='once'?' selected':'')+'>once 仅手动</option></select></div></div>'+
+    '<div><label>搬运文件大小范围</label><select data-size="preset">'+sizePresetOptions(r)+'</select></div></div>'+
+    '<div class="row" data-custom="'+(isCustomSize(r)?'1':'0')+'" style="'+(isCustomSize(r)?'':'display:none')+'">'+
+    '<div><label>自定义范围</label><input data-size="custom" placeholder="如 1GB~10GB / 小于5GB / 大于1GB" value="'+escAttr(sizeCustomText(r))+'"></div></div>'+
+    '<div class="row"><div><label>调度</label><select data-f="schedule_type"><option value="interval"'+(r.schedule_type==='interval'?' selected':'')+'>interval 每N分钟</option><option value="daily"'+(r.schedule_type==='daily'?' selected':'')+'>daily 每天</option><option value="once"'+(r.schedule_type==='once'?' selected':'')+'>once 仅手动</option></select></div>'+
     '<div class="row"><div><label>间隔(分钟)</label><input data-f="interval_minutes" value="'+(r.interval_minutes||30)+'" type="number" min="1"></div>'+
     '<div><label>daily 时间</label><input data-f="run_at" value="'+(r.run_at||'03:00')+'"></div></div>'+
     '<label class="hint"><input type="checkbox" data-f="enabled" '+en+'> 启用　<input type="checkbox" data-f="overwrite" '+(r.overwrite?'checked':'')+'> 强制覆盖　<input type="checkbox" data-f="delete_empty_dirs" '+(r.delete_empty_dirs?'checked':'')+'> move删空目录</label>'+
@@ -399,8 +454,27 @@ function bindRoute(c){
     el.querySelector('[data-act="run"]').onclick=()=>{ fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id,name:r.name})}); msg('已触发：'+r.name); poll(); };
     el.querySelector('[data-act="pick_src"]').onclick=()=>openPicker(c.id,i,'src_path');
     el.querySelector('[data-act="pick_dst"]').onclick=()=>openPicker(c.id,i,'dst_path');
+
+    // 大小范围：下拉切档位，选到「自定义」才显示输入框
+    const presetSel=el.querySelector('[data-size="preset"]');
+    const customRow=el.querySelector('[data-custom]');
+    const customInp=el.querySelector('[data-size="custom"]');
+    if(presetSel){
+      presetSel.onchange=()=>{
+        const v=presetSel.value;
+        if(v==='custom'){ customRow.style.display=''; customInp.focus(); return; }
+        const parts=v.split('|');
+        r.min_size=parts[0]; r.max_size=parts[1];
+        customRow.style.display='none';
+      };
+    }
+    if(customInp){
+      const apply=()=>{ const p=parseCustomSize(customInp.value); r.min_size=p.min_size; r.max_size=p.max_size; };
+      customInp.addEventListener('input',apply);
+      customInp.addEventListener('change',apply);
+    }
   });
-  $('addRoute').onclick=()=>{ routes.push({name:'路线'+(routes.length+1),src_path:'',dst_path:'',mode:'copy',enabled:true,overwrite:false,delete_empty_dirs:false,schedule_type:'interval',interval_minutes:30,run_at:'03:00'}); renderPanel(); };
+  $('addRoute').onclick=()=>{ routes.push({name:'路线'+(routes.length+1),src_path:'',dst_path:'',mode:'copy',enabled:true,overwrite:false,delete_empty_dirs:false,schedule_type:'interval',interval_minutes:30,run_at:'03:00',min_size:'',max_size:''}); renderPanel(); };
   $('saveRoutes').onclick=async()=>{ const r=await persist(); const j=await r.json(); msg(j.ok?'路线已保存':'保存失败：'+j.error); };
   $('runAll').onclick=async()=>{ const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id})}); const j=await r.json(); msg(j.ok?('已触发 '+j.started+' 条'):'触发失败：'+j.error); poll(); };
 }
@@ -427,7 +501,7 @@ async function poll(){
     const s=await (await fetch('/api/status')).json();
     let txt=(s.running?'有任务运行中…':'空闲');
     const keys=Object.keys(s.routes||{});
-    if(keys.length){ txt+='\n各路线最近结果：'; keys.forEach(k=>{ const x=s.routes[k]; txt+='\n  · '+k+'：'+(x.last_run||'-')+(x.error?' 失败:'+x.error:(x.stats?(' 已搬'+x.stats.copied+'/跳'+x.stats.skipped+'/失败'+x.stats.failed):'')); }); }
+    if(keys.length){ txt+='\n各路线最近结果：'; keys.forEach(k=>{ const x=s.routes[k]; const st=x.stats; txt+='\n  · '+k+'：'+(x.last_run||'-')+(x.error?' 失败:'+x.error:(st?(' 已搬'+st.copied+'/跳'+st.skipped+'/超范围'+(st.out_of_range||0)+'/失败'+st.failed):'')); }); }
     $('status').textContent=txt;
     const l=await (await fetch('/api/logs?n=300')).json();
     $('logs').textContent=l.logs||'(暂无日志)';
