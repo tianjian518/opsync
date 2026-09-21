@@ -7,6 +7,8 @@
   - move 模式删除源并清理空目录
   - 按单个文件大小范围筛选（范围外文件留在源目录，copy/move 都不动）
   - 大小字符串解析（GB/MB/KB/B、裸数字按 MB）
+  - 多级子目录递归搬运，以及「单个子目录出错不拖垮整条路线」
+  - list_files 对「目录不存在 / content 为 null」的容错
 """
 
 import os
@@ -250,6 +252,138 @@ class TestParseSize(unittest.TestCase):
         self.assertTrue(sync.in_range(200, 100, 0))
         self.assertFalse(sync.in_range(50, 100, 0))
         self.assertIn("不限", sync.describe_range({}))
+
+
+class TestNestedDirsAndRobustness(unittest.TestCase):
+    """回归：子目录必须被搬，且单个子目录出错不能拖垮整条路线。
+
+    线上问题：源目录里有多个电影子目录，结果只搬了根目录的散装视频，
+    子目录全没反应。原因是目标侧子目录还没建，list_files 拿到
+    code=500 object not found，_api 抛错 → 整条递归在第一个子目录就中断了。
+    """
+
+    def setUp(self):
+        # 根目录 2 个散装文件 + 2 个子目录，每个子目录里有自己的文件
+        FakeClient.store = {
+            "/photos": {"is_dir": True, "size": 0},
+            "/photos/loose1.mkv": {"is_dir": False, "size": 100},
+            "/photos/loose2.mkv": {"is_dir": False, "size": 200},
+            "/photos/子目录A": {"is_dir": True, "size": 0},
+            "/photos/子目录A/a1.mkv": {"is_dir": False, "size": 300},
+            "/photos/子目录A/a2.mkv": {"is_dir": False, "size": 400},
+            "/photos/子目录B": {"is_dir": True, "size": 0},
+            "/photos/子目录B/b1.mkv": {"is_dir": False, "size": 500},
+        }
+
+    @patch("sync.OpenListClient", FakeClient)
+    def test_all_nested_dirs_are_copied(self):
+        engine = sync.SyncEngine(OL)
+        stats = engine.run_route(build_route("r", "copy"))
+        self.assertEqual(stats["copied"], 5)      # 2 散装 + 2 + 1
+        self.assertEqual(stats["failed"], 0)
+        for p in ("/backup/loose1.mkv", "/backup/loose2.mkv",
+                  "/backup/子目录A/a1.mkv", "/backup/子目录A/a2.mkv",
+                  "/backup/子目录B/b1.mkv"):
+            self.assertIn(p, FakeClient.store)
+
+    @patch("sync.OpenListClient", FakeClient)
+    def test_nested_dirs_respect_size_filter(self):
+        """大小筛选要作用到子目录里的文件，而不只是根目录。"""
+        engine = sync.SyncEngine(OL)
+        stats = engine.run_route(build_route("r", "copy", min_size="250B", max_size="450B"))
+        self.assertEqual(stats["copied"], 2)       # a1(300) + a2(400)
+        self.assertEqual(stats["out_of_range"], 3)
+        self.assertIn("/backup/子目录A/a1.mkv", FakeClient.store)
+        self.assertNotIn("/backup/子目录B/b1.mkv", FakeClient.store)
+
+    @patch("sync.OpenListClient", FakeClient)
+    def test_one_broken_subdir_does_not_stop_others(self):
+        """某个子目录炸了，兄弟目录仍要继续搬（这是线上那个 bug 的核心）。"""
+        real = FakeClient.list_files
+
+        def flaky(self, path):
+            if path.endswith("/子目录A"):
+                raise RuntimeError("模拟接口抽风")
+            return real(self, path)
+
+        with patch.object(FakeClient, "list_files", flaky):
+            engine = sync.SyncEngine(OL)
+            stats = engine.run_route(build_route("r", "copy"))
+        # 子目录B 不能因为 子目录A 失败而被跳过
+        self.assertIn("/backup/子目录B/b1.mkv", FakeClient.store)
+        self.assertEqual(stats["copied"], 3)       # 2 散装 + b1
+        self.assertEqual(stats["failed"], 1)       # 子目录A 计入失败
+
+    @patch("sync.OpenListClient", FakeClient)
+    def test_entries_without_name_ignored(self):
+        """接口返回残缺条目时不能崩。"""
+        real = FakeClient.list_files
+
+        def messy(self, path):
+            return real(self, path) + [{"is_dir": False}, None]
+
+        with patch.object(FakeClient, "list_files", messy):
+            engine = sync.SyncEngine(OL)
+            stats = engine.run_route(build_route("r", "copy"))
+        self.assertEqual(stats["copied"], 5)
+        self.assertEqual(stats["failed"], 0)
+
+
+class TestListFilesTolerance(unittest.TestCase):
+    """list_files 对「目录不存在 / content 为 null」必须返回 []，而不是抛错。"""
+
+    def _client(self, responses):
+        from openlist_client import OpenListClient
+
+        c = OpenListClient("http://x", "u", "p")
+        c.token = "t"
+        calls = {"i": 0}
+
+        def fake_api(method, path, **kwargs):
+            r = responses[min(calls["i"], len(responses) - 1)]
+            calls["i"] += 1
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        c._api = fake_api
+        return c
+
+    def test_not_found_returns_empty(self):
+        from openlist_client import OpenListError
+
+        c = self._client([OpenListError("接口 /api/fs/list 失败: code=500 msg=failed get objs: "
+                                       "failed get dir: object not found")])
+        self.assertEqual(c.list_files("/不存在"), [])
+
+    def test_null_content_returns_empty(self):
+        c = self._client([{"code": 200, "data": {"content": None}}])
+        self.assertEqual(c.list_files("/空目录"), [])
+
+    def test_null_data_returns_empty(self):
+        c = self._client([{"code": 200, "data": None}])
+        self.assertEqual(c.list_files("/怪目录"), [])
+
+    def test_normal_listing(self):
+        c = self._client([{"code": 200, "data": {"content": [
+            {"name": "a.mkv", "is_dir": False, "size": 1},
+        ]}}])
+        self.assertEqual(len(c.list_files("/x")), 1)
+
+    def test_other_errors_still_raise(self):
+        from openlist_client import OpenListError
+
+        c = self._client([OpenListError("接口 /api/fs/list 失败: code=401 msg=token expired")])
+        with self.assertRaises(OpenListError):
+            c.list_files("/x")
+
+    def test_pagination(self):
+        full = [{"name": f"f{i}", "is_dir": False, "size": 1} for i in range(500)]
+        c = self._client([
+            {"code": 200, "data": {"content": full}},
+            {"code": 200, "data": {"content": [{"name": "last", "is_dir": False, "size": 1}]}},
+        ])
+        self.assertEqual(len(c.list_files("/many")), 501)
 
 
 class TestConfigRoutesNormalized(unittest.TestCase):

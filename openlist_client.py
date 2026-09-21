@@ -21,6 +21,24 @@ class OpenListError(RuntimeError):
     """OpenList 接口返回非成功 code 时抛出。"""
 
 
+# 各存储后端在「目录/文件不存在」时给的说法不太统一，这里统一识别
+_NOT_FOUND_HINTS = (
+    "object not found",
+    "not found",
+    "no such file",
+    "does not exist",
+    "not exist",
+    "object_not_found",
+    "failed get objs",
+)
+
+
+def _is_not_found(exc: Exception) -> bool:
+    """判断异常是否表示「目标不存在」。"""
+    msg = str(exc).lower()
+    return any(h in msg for h in _NOT_FOUND_HINTS)
+
+
 class OpenListClient:
     def __init__(self, base_url: str, username: str, password: str, timeout: int = 120):
         self.base_url = base_url.rstrip("/")
@@ -125,16 +143,31 @@ class OpenListClient:
 
     # ------------------------------------------------------------------ 目录
     def list_files(self, path: str, password: str = "") -> list[dict]:
-        """列出某目录下的全部条目（自动翻页）。"""
+        """列出某目录下的全部条目（自动翻页）。
+
+        目录不存在时返回空列表（而不是抛错）。这一点很关键：
+        搬运时目标侧的目录是「边遍历边创建」的，父目录刚建好、子目录还没建，
+        此时去列它就会拿到 code=500 object not found —— 若直接抛错，
+        整条路线的递归会在第一个子目录处中断。
+        """
         entries: list[dict] = []
         page = 1
         while True:
-            data = self._api(
-                "POST",
-                "/api/fs/list",
-                json={"path": path, "password": password, "page": page, "per_page": 500, "refresh": False},
-            )
-            content = data["data"]["content"]
+            try:
+                data = self._api(
+                    "POST",
+                    "/api/fs/list",
+                    json={"path": path, "password": password, "page": page, "per_page": 500, "refresh": False},
+                )
+            except OpenListError as exc:
+                if _is_not_found(exc):
+                    return []          # 目录还不存在 → 视为空目录
+                raise
+            # 某些存储后端会返回 data=null 或 content=null，都不能当成可迭代对象
+            payload = data.get("data") or {}
+            content = payload.get("content") or []
+            if not isinstance(content, list):
+                content = []
             entries.extend(content)
             # 单页未拉满即视为最后一页（兼容无 has_more 字段的老版本）
             if len(content) < 500:
@@ -151,18 +184,37 @@ class OpenListClient:
             return None
 
     def mkdir(self, path: str) -> None:
-        """创建单个目录（不存在才建，已存在则忽略）。"""
-        if self.get_file_info(path) is not None:
-            return
-        self._api("POST", "/api/fs/mkdir", json={"path": path})
+        """创建单个目录（已存在则直接返回，不报错）。"""
+        try:
+            if self.get_file_info(path) is not None:
+                return
+        except OpenListError:
+            pass          # 查不到信息就当作不存在，直接尝试创建
+        try:
+            self._api("POST", "/api/fs/mkdir", json={"path": path})
+        except OpenListError as exc:
+            if _is_not_found(exc):
+                return    # 并发/竞态下别人已建好，视为成功
+            raise
 
     def ensure_dir(self, full_dir: str) -> None:
-        """逐级创建目录树。"""
+        """逐级创建目录树。
+
+        建完再复查一遍：网盘（尤其刚被写入过父目录时）对 list/get 可能有
+        短暂的缓存不一致，导致 mkdir 明明成功了、紧接着列目录却仍报 not found。
+        复查不过就重建一次，避免把「目录没建出来」带到后面的 copy 里。
+        """
         parts = [p for p in full_dir.split("/") if p]
         cur = ""
         for part in parts:
             cur = f"{cur}/{part}"
             self.mkdir(cur)
+        # 复查：确认最深一级确实存在（目录树已逐级创建，只需查最后一级）
+        try:
+            if self.get_file_info(full_dir) is None:
+                self._api("POST", "/api/fs/mkdir", json={"path": full_dir})
+        except OpenListError:
+            pass
 
     # ----------------------------------------------------- 同实例：复制 / 移动
     def copy(self, src_dir: str, dst_dir: str, names: list[str]) -> None:

@@ -80,6 +80,13 @@ def in_range(size, lo, hi) -> bool:
     return True
 
 
+def _valid_entries(entries) -> list:
+    """过滤掉接口返回的残缺条目（None、非 dict、没有 name 的），避免遍历时崩掉。"""
+    if not entries:
+        return []
+    return [e for e in entries if isinstance(e, dict) and e.get("name")]
+
+
 def describe_range(route: dict) -> str:
     """给人看的大小范围描述，用于日志。"""
     lo, hi = size_range(route)
@@ -128,11 +135,15 @@ class SyncEngine:
     # ------------------------------------------------------------------ 递归
     def _walk(self, src_dir, dst_dir, mode, overwrite, delete_empty, stats, lo, hi, is_root=False):
         self.client.ensure_dir(dst_dir)
-        entries = self.client.list_files(src_dir)
+        entries = _valid_entries(self.client.list_files(src_dir))
         files = [e for e in entries if not e["is_dir"]]
         dirs = [e for e in entries if e["is_dir"]]
 
-        dst_index = {e["name"]: e for e in self.client.list_files(dst_dir)}
+        # 目标目录刚建好，这里再列一次拿「已有哪些文件」用于跳过判断；
+        # list_files 对不存在的目录返回 []，所以不会因为目标侧滞后而炸掉。
+        dst_index = {e["name"]: e for e in _valid_entries(self.client.list_files(dst_dir))}
+        logger.debug("扫描 %s：文件 %d 个，子目录 %d 个（目标已有 %d 项）",
+                     src_dir, len(files), len(dirs), len(dst_index))
 
         pending = []
         for e in files:
@@ -162,8 +173,16 @@ class SyncEngine:
                 stats["failed"] += len(names)
 
         for d in dirs:
-            self._walk(f"{src_dir}/{d['name']}", f"{dst_dir}/{d['name']}",
-                       mode, overwrite, delete_empty, stats, lo, hi, is_root=False)
+            # 单个子目录出错不能拖垮整条路线：否则第一个失败的子目录会让
+            # 后面所有兄弟目录都不再被处理（表现就是「只搬了根目录的散装文件，
+            # 子目录全没反应」）。这里兜住异常、计入 failed，继续下一个。
+            try:
+                self._walk(f"{src_dir}/{d['name']}", f"{dst_dir}/{d['name']}",
+                           mode, overwrite, delete_empty, stats, lo, hi, is_root=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("子目录处理失败 %s -> %s/%s: %s",
+                             f"{src_dir}/{d['name']}", dst_dir, d["name"], exc)
+                stats["failed"] += 1
 
         if mode == "move" and not is_root and delete_empty:
             # 源目录里若还有因「超出大小范围」而留下的文件，则不能删（否则等于误删用户数据）
