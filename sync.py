@@ -10,10 +10,56 @@
 
 import logging
 import re
+import threading
 
 from openlist_client import OpenListClient
 
 logger = logging.getLogger("opsync")
+
+
+class RouteCancelled(Exception):
+    """路线被用户强制终止时抛出。
+
+    刻意不在搬运途中打断 —— 只在「一个目录处理完、准备进入下一个动作」的安全点
+    检查。这样不会留下半截的复制请求，最多是少搬几个条目，可重复执行补上。
+    """
+
+
+class CancelToken:
+    """协作式取消令牌。
+
+    - cancel() 由 Web 层调用（可能来自另一个线程），置位后：
+        - 下一次 check() 抛 RouteCancelled
+        - 若正在等 HTTP 响应，wait() 会被立即唤醒，sleep_until() 会提前返回，
+          从而不必等当前请求超时就能退出
+    - 线程安全：内部用 threading.Event
+    """
+
+    def __init__(self):
+        self._ev = threading.Event()
+
+    def cancel(self) -> None:
+        self._ev.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._ev.is_set()
+
+    def check(self) -> None:
+        """到达安全点时调用；已取消则抛出 RouteCancelled。"""
+        if self._ev.is_set():
+            raise RouteCancelled("已被用户强制终止")
+
+    def wait(self, timeout: float) -> bool:
+        """可中断地等待 timeout 秒。
+
+        返回 True 表示「被取消」，调用方应尽快退出。
+        """
+        return self._ev.wait(timeout)
+
+    def sleep(self, seconds: float) -> None:
+        """可中断 sleep：被取消时立即返回（由调用方的 check() 抛出）。"""
+        self._ev.wait(seconds)
 
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -109,10 +155,14 @@ def describe_range(route: dict) -> str:
 
 
 class SyncEngine:
-    def __init__(self, openlist_cfg: dict):
+    def __init__(self, openlist_cfg: dict, token: "CancelToken | None" = None):
         self.client = OpenListClient(
             openlist_cfg["url"], openlist_cfg["username"], openlist_cfg["password"]
         )
+        # 取消令牌：接上后才能被「强制终止」。为 None 时退化为不可取消（行为同旧版）。
+        self.token = token or CancelToken()
+        # 把令牌挂到 HTTP 客户端上，让正在等待的请求也能被立刻唤醒
+        self.client.cancel_token = self.token
         self.client.login()
 
     def run_route(self, route: dict) -> dict:
@@ -122,11 +172,24 @@ class SyncEngine:
         overwrite = route.get("overwrite", False)
         delete_empty = route.get("delete_empty_dirs", False)
         lo, hi = size_range(route)
-        stats = {"copied": 0, "skipped": 0, "failed": 0, "removed": 0, "out_of_range": 0}
+        stats = {"copied": 0, "skipped": 0, "failed": 0, "removed": 0,
+                 "out_of_range": 0, "cancelled": False}
 
         logger.info("路线[%s] 开始：%s -> %s（模式=%s，大小范围=%s）",
                     route.get("name", "?"), src, dst, mode, describe_range(route))
-        self._walk(src, dst, mode, overwrite, delete_empty, stats, lo, hi, is_root=True)
+        try:
+            self._walk(src, dst, mode, overwrite, delete_empty, stats, lo, hi, is_root=True)
+        except RouteCancelled:
+            # 被强制终止不是错误：把已完成的部分如实返回，并在结果里标记出来
+            stats["cancelled"] = True
+            logger.warning("路线[%s] 已被强制终止（已搬运=%d，跳过=%d，超出范围=%d，失败=%d）",
+                           route.get("name", "?"), stats["copied"], stats["skipped"],
+                           stats["out_of_range"], stats["failed"])
+            return stats
+        if self.token.cancelled:
+            stats["cancelled"] = True
+            logger.warning("路线[%s] 已被强制终止（已搬运=%d）", route.get("name", "?"), stats["copied"])
+            return stats
         logger.info("路线[%s] 完成：已搬运=%d，跳过=%d，超出范围=%d，失败=%d，删除源=%d",
                     route.get("name", "?"), stats["copied"], stats["skipped"],
                     stats["out_of_range"], stats["failed"], stats["removed"])
@@ -134,6 +197,9 @@ class SyncEngine:
 
     # ------------------------------------------------------------------ 递归
     def _walk(self, src_dir, dst_dir, mode, overwrite, delete_empty, stats, lo, hi, is_root=False):
+        # 每进入一个目录先检查一次：已在搬运途中被打断的动作不追回，
+        # 但可以保证「每搬完一个目录就有一个安全退出点」，不会继续往下扩散。
+        self.token.check()
         self.client.ensure_dir(dst_dir)
         entries = _valid_entries(self.client.list_files(src_dir))
         files = [e for e in entries if not e["is_dir"]]
@@ -157,6 +223,10 @@ class SyncEngine:
                 continue
             pending.append(e)
 
+        # 准备发起复制/移动前再检查一次：宁可不搬，也不要在被终止后还发出新请求
+        if pending:
+            self.token.check()
+
         if pending:
             names = [e["name"] for e in pending]
             try:
@@ -179,6 +249,10 @@ class SyncEngine:
             try:
                 self._walk(f"{src_dir}/{d['name']}", f"{dst_dir}/{d['name']}",
                            mode, overwrite, delete_empty, stats, lo, hi, is_root=False)
+            except RouteCancelled:
+                # 强制终止必须一路向上传出去，不能被这里的容错吃掉 ——
+                # 否则会「记一次 failed 然后继续搬下一个目录」，终止就失效了。
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.error("子目录处理失败 %s -> %s/%s: %s",
                              f"{src_dir}/{d['name']}", dst_dir, d["name"], exc)

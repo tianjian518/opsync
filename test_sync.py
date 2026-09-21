@@ -12,6 +12,7 @@
 """
 
 import os
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -24,9 +25,11 @@ class FakeClient:
 
     store: dict = {}
 
-    def __init__(self, base_url, username, password):
+    def __init__(self, base_url, username, password, timeout=120, cancel_token=None):
         self.base_url = base_url
         self.username = username
+        self.timeout = timeout
+        self.cancel_token = cancel_token
 
     def login(self):
         return "fake-token"
@@ -384,6 +387,146 @@ class TestListFilesTolerance(unittest.TestCase):
             {"code": 200, "data": {"content": [{"name": "last", "is_dir": False, "size": 1}]}},
         ])
         self.assertEqual(len(c.list_files("/many")), 501)
+
+
+class TestForceStop(unittest.TestCase):
+    """强制终止：停止后不再发起新动作，且如实报告已完成的部分。
+
+    设计取舍：只在「安全点」中断（进入目录前、发起复制前），
+    已经发出的单个复制请求会跑完 —— 这样不会留下半截搬运、也不会误删。
+    """
+
+    def setUp(self):
+        seed()
+
+    def test_cancel_before_start_copies_nothing(self):
+        token = sync.CancelToken()
+        token.cancel()
+        with patch("sync.OpenListClient", FakeClient):
+            engine = sync.SyncEngine(OL, token=token)
+            stats = engine.run_route(build_route("r", "copy"))
+        self.assertTrue(stats["cancelled"])
+        self.assertEqual(stats["copied"], 0)
+        self.assertNotIn("/backup/a.jpg", FakeClient.store)
+
+    def test_cancel_midway_stops_remaining_dirs(self):
+        """搬到一半被终止：已搬的保留，没轮到的目录不再处理。"""
+        seed()
+        # 两个子目录：搬完 dir1 之后终止，dir2 就不该再被处理
+        FakeClient.store = {
+            "/photos": {"is_dir": True, "size": 0},
+            "/photos/a.jpg": {"is_dir": False, "size": 100},
+            "/photos/dir1": {"is_dir": True, "size": 0},
+            "/photos/dir1/c.jpg": {"is_dir": False, "size": 300},
+            "/photos/dir2": {"is_dir": True, "size": 0},
+            "/photos/dir2/e.jpg": {"is_dir": False, "size": 500},
+        }
+        token = sync.CancelToken()
+
+        class CancelAfterDir1(FakeClient):
+            def copy(self, src_dir, dst_dir, names):
+                super().copy(src_dir, dst_dir, names)
+                if src_dir.endswith("/dir1"):
+                    token.cancel()      # 搬完 dir1 后模拟用户点终止
+
+        with patch("sync.OpenListClient", CancelAfterDir1):
+            engine = sync.SyncEngine(OL, token=token)
+            stats = engine.run_route(build_route("r", "copy"))
+
+        self.assertTrue(stats["cancelled"])
+        self.assertEqual(stats["failed"], 0)          # 终止不算失败
+        self.assertIn("/backup/a.jpg", FakeClient.store)      # 根目录散装文件已搬
+        self.assertIn("/backup/dir1/c.jpg", FakeClient.store)  # dir1 已搬
+        self.assertNotIn("/backup/dir2/e.jpg", FakeClient.store)  # dir2 未处理 ✓
+
+    def test_cancelled_stats_are_honest_about_what_was_done(self):
+        """终止时 stats 必须如实反映已完成量，不能显示成全部失败。"""
+        token = sync.CancelToken()
+
+        class StopAfterFirstClient(FakeClient):
+            def copy(self, src_dir, dst_dir, names):
+                super().copy(src_dir, dst_dir, names)
+                token.cancel()          # 第一次复制完成后立刻终止
+
+        with patch("sync.OpenListClient", StopAfterFirstClient):
+            engine = sync.SyncEngine(OL, token=token)
+            stats = engine.run_route(build_route("r", "copy"))
+        self.assertGreater(stats["copied"], 0)
+        self.assertEqual(stats["failed"], 0)      # 终止不是失败
+        self.assertTrue(stats["cancelled"])
+        # 已搬过去的文件确实在目标侧
+        self.assertIn("/backup/a.jpg", FakeClient.store)
+
+    def test_move_mode_cancel_does_not_lose_files(self):
+        """move 模式被终止：已移动的文件在目标侧，源侧对应删除，不会两头都没有。"""
+        token = sync.CancelToken()
+
+        class StopAfterFirstClient(FakeClient):
+            def move(self, src_dir, dst_dir, names):
+                super().move(src_dir, dst_dir, names)
+                token.cancel()
+
+        with patch("sync.OpenListClient", StopAfterFirstClient):
+            engine = sync.SyncEngine(OL, token=token)
+            stats = engine.run_route(build_route("r", "move"))
+        self.assertTrue(stats["cancelled"])
+        moved = [p for p in FakeClient.store if p.startswith("/backup/")]
+        self.assertTrue(moved, "至少应有文件被搬到目标侧")
+        for p in moved:
+            src_equiv = "/photos/" + p[len("/backup/"):]
+            self.assertNotIn(src_equiv, FakeClient.store, f"{src_equiv} 应已从源侧移除")
+
+    def test_no_token_behaves_like_before(self):
+        """不传令牌时行为与旧版一致，新增逻辑不能影响原有搬运。"""
+        with patch("sync.OpenListClient", FakeClient):
+            engine = sync.SyncEngine(OL)
+            stats = engine.run_route(build_route("r", "copy"))
+        self.assertEqual(stats["copied"], 4)
+        self.assertFalse(stats["cancelled"])
+
+    def test_token_wait_is_interruptible(self):
+        """sleep/wait 必须能被立刻唤醒，否则终止要等满超时才生效。"""
+        import time as _t
+        token = sync.CancelToken()
+        threading.Timer(0.05, token.cancel).start()
+        t0 = _t.time()
+        token.wait(10)                 # 若不可中断会阻塞 10 秒
+        self.assertLess(_t.time() - t0, 1.0)
+        self.assertTrue(token.cancelled)
+
+    def test_check_raises_after_cancel(self):
+        token = sync.CancelToken()
+        token.check()                  # 未取消：不应抛
+        token.cancel()
+        with self.assertRaises(sync.RouteCancelled):
+            token.check()
+
+    def test_cancel_token_is_thread_safe(self):
+        """令牌会在另一个线程被置位（Web 请求线程 vs 搬运线程）。"""
+        token = sync.CancelToken()
+        self.assertFalse(token.cancelled)
+        t = threading.Thread(target=token.cancel)   # 模拟 Web 线程发终止
+        t.start()
+        t.join()
+        self.assertTrue(token.cancelled)
+
+    def test_route_cancelled_is_not_swallowed_by_subdir_handler(self):
+        """子目录的容错不能吃掉 RouteCancelled，否则终止会失效。"""
+        seed()
+        token = sync.CancelToken()
+
+        class Boom(FakeClient):
+            def list_files(self, path):
+                if path.endswith("/2023"):
+                    token.cancel()
+                    raise RuntimeError("模拟子目录出问题")
+                return super().list_files(path)
+
+        with patch("sync.OpenListClient", Boom):
+            engine = sync.SyncEngine(OL, token=token)
+            stats = engine.run_route(build_route("r", "copy"))
+        # 终止信号发出后，整条路线应标记为已终止（而不是继续把 2023 记成失败还往下搬）
+        self.assertTrue(stats["cancelled"])
 
 
 class TestConfigRoutesNormalized(unittest.TestCase):

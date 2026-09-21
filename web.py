@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, make_response, request
 from confighelper import load_config, save_path, write_toml
 from openlist_client import OpenListClient
-from sync import SyncEngine
+from sync import CancelToken, SyncEngine
 
 app = Flask(__name__)
 PORT = int(os.environ.get("PORT", 7860))
@@ -30,6 +30,10 @@ _running = set()
 _running_lock = threading.Lock()
 _next = {}
 _exec = ThreadPoolExecutor(max_workers=6)
+# 正在执行的路线 -> 它的取消令牌。用于「强制终止」。
+_cancels: dict[str, CancelToken] = {}
+# 已记录过「用户点了终止」的 key，避免终止瞬间的结果被随后覆盖成普通失败
+_cancelled_keys: set[str] = set()
 _log_lock = threading.Lock()
 _log_lines: list[str] = []
 
@@ -71,20 +75,35 @@ def _key(conn_id: str, r: dict) -> str:
 
 def run_route_safe(ol: dict, r: dict, conn_id: str) -> None:
     key = _key(conn_id, r)
+    token = CancelToken()
     with _running_lock:
         if key in _running:
             return
         _running.add(key)
+        _cancels[key] = token
+        _cancelled_keys.discard(key)
+        _state["running"] = True
     try:
-        stats = SyncEngine(ol).run_route(r)
-        _route_results[key] = {"last_run": _now_str(), "stats": stats, "error": None}
-    except Exception:
+        stats = SyncEngine(ol, token=token).run_route(r)
+        with _running_lock:
+            was_cancelled = key in _cancelled_keys
+        if stats.get("cancelled") or was_cancelled:
+            _route_results[key] = {"last_run": _now_str(), "stats": stats,
+                                   "error": None, "cancelled": True}
+        else:
+            _route_results[key] = {"last_run": _now_str(), "stats": stats, "error": None}
+    except Exception as exc:  # noqa: BLE001
         _log.exception("账号[%s] 路线[%s] 执行失败", conn_id, r.get("name"))
-        _route_results[key] = {"last_run": _now_str(), "stats": None, "error": "执行出错，详见日志"}
+        _route_results[key] = {"last_run": _now_str(), "stats": None,
+                               "error": f"执行出错：{exc}"}
     finally:
         with _running_lock:
             _running.discard(key)
+            _cancels.pop(key, None)
             _state["running"] = bool(_running)
+            cancelled = key in _cancelled_keys
+        if cancelled:
+            _log.info("账号[%s] 路线[%s] 已停止", conn_id, r.get("name"))
 
 
 def compute_next(r: dict, now: datetime.datetime):
@@ -229,11 +248,49 @@ def api_run():
         return jsonify({"ok": False, "error": str(e)})
 
 
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    """强制终止正在执行的路线。
+
+    传 name 只停这一条；不传则停该账号下全部正在跑的路线。
+    采用协作式取消：立即置位令牌，正在进行的单个复制/移动请求会跑完，
+    之后不再发起新动作，因此不会留下半截的搬运或误删。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    conn_id = data.get("conn_id")
+    name = data.get("name")
+    stopped, not_running = [], []
+    with _running_lock:
+        for key in list(_cancels.keys()):
+            k_conn, _, k_name = key.partition("::")
+            if conn_id is not None and k_conn != conn_id:
+                continue
+            if name is not None and k_name != name:
+                continue
+            _cancels[key].cancel()
+            _cancelled_keys.add(key)
+            stopped.append(k_name)
+        # 该账号（或全部）下当前在跑的 key，用于提示「有没有在跑」
+        running_keys = [
+            k for k in _running
+            if (conn_id is None or k.partition("::")[0] == conn_id)
+            and (name is None or k.partition("::")[2] == name)
+        ]
+    not_running = [k.partition("::")[2] for k in running_keys if k.partition("::")[2] not in stopped]
+    if stopped:
+        _log.warning("收到强制终止请求：停止 %s", "、".join(stopped))
+    return jsonify({"ok": True, "stopped": stopped, "not_running": not_running})
+
+
 @app.route("/api/status")
 def api_status():
     with _running_lock:
         running = bool(_running)
-    return jsonify({"running": running, "routes": _route_results})
+        # 必须带上所属账号：不同账号可以有同名路线，
+        # 只返回名字会让「另一个账号正在跑同名路线」被误判成这条也在跑。
+        running_keys = sorted(_running)
+    return jsonify({"running": running, "routes": _route_results,
+                    "running_keys": running_keys})
 
 
 @app.route("/api/logs")
@@ -378,6 +435,7 @@ function renderPanel(){
       '<div class="actions"><button class="ghost" id="addRoute">+ 添加路线</button>'+
       '<button id="saveRoutes">保存路线</button>'+
       '<button class="ok" id="runAll">立即运行全部（本账号）</button>'+
+      '<button class="danger" id="stopAll">终止本账号全部</button>'+
       '<span id="routeMsg"></span></div>';
     p.appendChild(sec);
     bindRoute(c);
@@ -441,7 +499,7 @@ function parseCustomSize(text){
 function routeHTML(c,r,i){
   const en=r.enabled?'checked':'';
   return '<div class="route" data-i="'+i+'">'+
-    '<h3><span>路线 '+(i+1)+'</span><span><button class="ghost" data-act="run">运行</button> <button class="danger" data-act="del">删除</button></span></h3>'+
+    '<h3><span>路线 '+(i+1)+' <span class="runstate" data-runstate="'+i+'"></span></span><span><button class="ghost" data-act="run">运行</button> <button class="danger" data-act="stop" style="display:none">终止</button> <button class="danger" data-act="del">删除</button></span></h3>'+
     '<label>名称</label><input data-f="name" value="'+(r.name||'')+'">'+
     '<div class="row"><div><label>源目录</label><input data-f="src_path" value="'+(r.src_path||'')+'"></div><div><button class="ghost" data-act="pick_src">浏览选择</button></div></div>'+
     '<div class="row"><div><label>目标目录</label><input data-f="dst_path" value="'+(r.dst_path||'')+'"></div><div><button class="ghost" data-act="pick_dst">浏览选择</button></div></div>'+
@@ -473,6 +531,15 @@ function bindRoute(c){
     const on=(sel,fn)=>{ const n=el.querySelector(sel); if(n) n.onclick=fn; };
     on('[data-act="del"]',()=>{ routes.splice(i,1); renderPanel(); });
     on('[data-act="run"]',()=>{ fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id,name:r.name})}); msg('已触发：'+r.name); poll(); });
+    on('[data-act="stop"]',async()=>{
+      const btn=el.querySelector('[data-act="stop"]');
+      if(btn){ btn.disabled=true; btn.textContent='终止中…'; }
+      const res=await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id,name:r.name})});
+      const j=await res.json();
+      if(j.stopped&&j.stopped.length) msg('正在终止：'+j.stopped.join('、'));
+      else msg('该路线当前没有在运行');
+      poll();
+    });
     on('[data-act="pick_src"]',()=>openPicker(c.id,i,'src_path'));
     on('[data-act="pick_dst"]',()=>openPicker(c.id,i,'dst_path'));
 
@@ -500,6 +567,12 @@ function bindRoute(c){
   bind('addRoute',()=>{ routes.push({name:'路线'+(routes.length+1),src_path:'',dst_path:'',mode:'copy',enabled:true,overwrite:false,delete_empty_dirs:false,schedule_type:'interval',interval_minutes:30,run_at:'03:00',min_size:'',max_size:''}); renderPanel(); });
   bind('saveRoutes',async()=>{ const r=await persist(); const j=await r.json(); msg(j.ok?'路线已保存':'保存失败：'+j.error); });
   bind('runAll',async()=>{ const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id})}); const j=await r.json(); msg(j.ok?('已触发 '+j.started+' 条'):'触发失败：'+j.error); poll(); });
+  bind('stopAll',async()=>{
+    const res=await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id})});
+    const j=await res.json();
+    msg((j.stopped&&j.stopped.length)?('正在终止：'+j.stopped.join('、')):'本账号当前没有在运行的路线');
+    poll();
+  });
 }
 function msg(t){ const m=$('routeMsg')||$('msg'); if(m) m.textContent=t; }
 function addConn(){ const id='conn-'+Date.now(); conns.push({id:id,name:'新账号',url:'',username:'',password:'',tested_ok:false,routes:[]}); activeId=id; renderTabs(); renderPanel(); }
@@ -522,10 +595,35 @@ $('pickerOk').onclick=()=>{ const c=connById(picker.connId); if(c&&Array.isArray
 async function poll(){
   try{
     const s=await (await fetch('/api/status')).json();
-    let txt=(s.running?'有任务运行中…':'空闲');
+    // running_keys 形如 "conn-id::路线名"；拼成「账号 :: 路线名」便于区分同名路线
+    const runningKeys=s.running_keys||[];
+    const keyName=k=>k.split('::')[1]||k;
+    let txt=(s.running?('有任务运行中：'+runningKeys.join('、')):'空闲');
     const keys=Object.keys(s.routes||{});
-    if(keys.length){ txt+='\n各路线最近结果：'; keys.forEach(k=>{ const x=s.routes[k]; const st=x.stats; txt+='\n  · '+k+'：'+(x.last_run||'-')+(x.error?' 失败:'+x.error:(st?(' 已搬'+st.copied+'/跳'+st.skipped+'/超范围'+(st.out_of_range||0)+'/失败'+st.failed):'')); }); }
+    if(keys.length){ txt+='\n各路线最近结果：'; keys.forEach(k=>{ const x=s.routes[k]; const st=x.stats;
+      const tail=x.error?(' 失败:'+x.error):(st?((st.cancelled?' 已终止':(x.cancelled?' 已终止':''))+' 已搬'+st.copied+'/跳'+st.skipped+'/超范围'+(st.out_of_range||0)+'/失败'+st.failed):'');
+      txt+='\n  · '+k+'：'+(x.last_run||'-')+tail; }); }
     $('status').textContent=txt;
+
+    // 每个路线卡片显示「运行中/已终止」并切换「运行 / 终止」按钮
+    // 按「账号::路线名」精确匹配，避免把别的账号的同名路线误显示成运行中
+    const routesNow=(connById(activeId)||{}).routes||[];
+    routesNow.forEach((r,i)=>{
+      const running=runningKeys.indexOf(activeId+'::'+r.name)>=0;
+      const state=document.querySelector('[data-runstate="'+i+'"]');
+      if(state){ state.textContent=running?'⏳ 运行中':''
+        ; state.style.color=running?'#e8a33d':''; }
+      const el=document.querySelector('.route[data-i="'+i+'"]');
+      if(!el) return;
+      const runBtn=el.querySelector('[data-act="run"]');
+      const stopBtn=el.querySelector('[data-act="stop"]');
+      if(runBtn){ runBtn.disabled=running; runBtn.textContent=running?'运行中…':'运行'; }
+      if(stopBtn){
+        stopBtn.style.display=running?'':'none';
+        if(!running){ stopBtn.disabled=false; stopBtn.textContent='终止'; }
+      }
+    });
+
     const l=await (await fetch('/api/logs?n=300')).json();
     $('logs').textContent=l.logs||'(暂无日志)';
   }catch(e){}

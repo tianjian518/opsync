@@ -11,10 +11,11 @@
 API 路径与字段名严格对齐 AList v3 / OpenList 官方文档。
 """
 
+import threading
+import time
 from urllib.parse import quote, urljoin, urlparse
 
 import requests
-import time
 
 
 class OpenListError(RuntimeError):
@@ -40,7 +41,8 @@ def _is_not_found(exc: Exception) -> bool:
 
 
 class OpenListClient:
-    def __init__(self, base_url: str, username: str, password: str, timeout: int = 120):
+    def __init__(self, base_url: str, username: str, password: str, timeout: int = 120,
+                 cancel_token=None):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
@@ -49,6 +51,25 @@ class OpenListClient:
         self.session = requests.Session()
         self._netloc = urlparse(self.base_url).netloc
         self._html_prefixes = ("<!doctype", "<html", "<!DOCTYPE", "<?xml")
+        # 可选的协作式取消令牌（来自 sync.CancelToken）。
+        # 接上之后，等待响应的过程中若被「强制终止」，不必等满 timeout 就能立刻退出。
+        self.cancel_token = cancel_token
+
+    def _cancelled(self) -> bool:
+        return bool(self.cancel_token is not None and self.cancel_token.cancelled)
+
+    def _check_cancelled(self) -> None:
+        """请求前后调用的取消检查。"""
+        if self._cancelled():
+            from sync import RouteCancelled
+            raise RouteCancelled("已被用户强制终止")
+
+    def _sleep(self, seconds: float) -> None:
+        """可中断 sleep：被取消时立即返回（后续 _check_cancelled 会抛出）。"""
+        if self.cancel_token is not None:
+            self.cancel_token.wait(seconds)
+        else:
+            time.sleep(seconds)
 
     # ------------------------------------------------------------------ 唤醒
     def _looks_html(self, text: str) -> bool:
@@ -72,16 +93,19 @@ class OpenListClient:
         - 网络层异常（休眠实例连接被拒 / 超时）会触发唤醒后重试；
         - 返回非 JSON（HTML warming 页 / 代理拦截页）同样触发唤醒后重试；
         - 最终失败抛出含 HTTP 状态与响应片段的清晰错误，便于排查。
+        - 若接了取消令牌：请求在后台线程里发出，主线程等待时可被立刻唤醒，
+          因此「强制终止」不需要等到 timeout 才生效。
         """
         last_err: str = "未知错误"
         for attempt in range(max_retries + 1):
+            self._check_cancelled()
             try:
-                resp = do_request()
+                resp = self._request_interruptible(do_request)
             except requests.RequestException as exc:
                 last_err = f"网络层异常: {exc}"
                 self._wake_once()
                 if attempt < max_retries:
-                    time.sleep(2 * (attempt + 1))
+                    self._sleep(2 * (attempt + 1))
                     continue
                 raise OpenListError(
                     f"请求 {url} 失败（{last_err}）。\n"
@@ -94,7 +118,7 @@ class OpenListClient:
                 # 休眠实例常返回 HTML warming 页，唤醒后重试
                 self._wake_once()
                 if attempt < max_retries:
-                    time.sleep(3 * (attempt + 1))
+                    self._sleep(3 * (attempt + 1))
                     continue
                 snippet = (resp.text or "").strip()[:200]
                 hint = "响应为 HTML，大概率是休眠的 HF Space 返回的 warming 页面或代理拦截页。" \
@@ -106,6 +130,38 @@ class OpenListClient:
                 )
         # 理论上不会到达
         raise OpenListError(f"请求 {url} 异常: {last_err}")
+
+    def _request_interruptible(self, do_request):
+        """发出请求，且在等待期间可被取消令牌立刻打断。
+
+        做法：请求放到后台线程（daemon）里跑，主线程只负责「等结果 or 等取消」。
+        被取消时立刻抛出，不等请求超时；后台线程会随连接超时自然结束，
+        因为是 daemon，不会阻止进程退出。
+
+        未接取消令牌时直接同步调用，零额外开销、行为与旧版完全一致。
+        """
+        if self.cancel_token is None:
+            return do_request()
+
+        box: dict = {}
+        done = threading.Event()
+
+        def worker():
+            try:
+                box["resp"] = do_request()
+            except BaseException as exc:  # noqa: BLE001  透传给主线程
+                box["exc"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        # 每 0.2 秒醒一次检查是否被终止，保证「强制终止」响应及时
+        while not done.wait(0.2):
+            self._check_cancelled()
+        self._check_cancelled()
+        if "exc" in box:
+            raise box["exc"]
+        return box["resp"]
 
     # ------------------------------------------------------------------ 基础
     def login(self) -> str:
