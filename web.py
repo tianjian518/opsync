@@ -16,7 +16,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, make_response, request
 from confighelper import load_config, save_path, write_toml
 from openlist_client import OpenListClient
 from sync import SyncEngine
@@ -131,7 +131,14 @@ def scheduler_loop() -> None:
 # ------------------------------------------------------------------ 路由
 @app.route("/")
 def index():
-    return HTML
+    # 页面里的 JS 是内嵌在 HTML 里的，浏览器一旦按启发式规则缓存了旧页面，
+    # 就会出现「服务端已经修好了、用户浏览器还在跑旧 JS」的诡异现象。
+    # 这里显式禁用缓存，保证每次刷新都拿到最新界面。
+    resp = make_response(HTML.replace("__BUILD__", BUILD_TAG))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/healthz")
@@ -237,6 +244,11 @@ def api_logs():
     return jsonify({"logs": "\n".join(lines)})
 
 
+# 每次进程启动生成一个构建标记，渲染到页面标题旁。
+# 用途：页面显示的 build 与容器启动时间不一致时，就说明浏览器缓存了旧页面
+# （服务端已禁用缓存，但用户手上可能有更早打开的标签页）。
+BUILD_TAG = datetime.datetime.now().strftime("%m-%d %H:%M:%S")
+
 HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -283,7 +295,7 @@ HTML = r"""<!doctype html>
 </head>
 <body>
 <div class="wrap">
-  <h1>opsync</h1>
+  <h1>opsync <span class="hint" style="font-size:12px;font-weight:normal">build __BUILD__</span></h1>
   <p class="sub">多个 OpenList 账号各自定时搬运网盘 · 每个账号一个子页面 · 登录信息持久化</p>
 
   <div class="tabs" id="tabs"></div>
@@ -366,7 +378,7 @@ function renderPanel(){
       '<div class="actions"><button class="ghost" id="addRoute">+ 添加路线</button>'+
       '<button id="saveRoutes">保存路线</button>'+
       '<button class="ok" id="runAll">立即运行全部（本账号）</button>'+
-      '<span id="msg"></span></div>';
+      '<span id="routeMsg"></span></div>';
     p.appendChild(sec);
     bindRoute(c);
   } else {
@@ -452,14 +464,17 @@ function bindRoute(c){
   const routes=c.routes;
   routes.forEach((r,i)=>{
     const el=document.querySelector('.route[data-i="'+i+'"]');
+    if(!el) return;                      // 卡片没渲染出来就跳过，别让整个绑定中断
     el.querySelectorAll('[data-f]').forEach(inp=>{
       const h=()=>{ r[inp.dataset.f]= inp.type==='checkbox'?inp.checked:inp.value; };
       inp.addEventListener('input',h); inp.addEventListener('change',h);
     });
-    el.querySelector('[data-act="del"]').onclick=()=>{ routes.splice(i,1); renderPanel(); };
-    el.querySelector('[data-act="run"]').onclick=()=>{ fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id,name:r.name})}); msg('已触发：'+r.name); poll(); };
-    el.querySelector('[data-act="pick_src"]').onclick=()=>openPicker(c.id,i,'src_path');
-    el.querySelector('[data-act="pick_dst"]').onclick=()=>openPicker(c.id,i,'dst_path');
+    // 用「取到才绑定」的方式，避免某个元素缺失时抛错导致后面的按钮全部绑不上
+    const on=(sel,fn)=>{ const n=el.querySelector(sel); if(n) n.onclick=fn; };
+    on('[data-act="del"]',()=>{ routes.splice(i,1); renderPanel(); });
+    on('[data-act="run"]',()=>{ fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id,name:r.name})}); msg('已触发：'+r.name); poll(); });
+    on('[data-act="pick_src"]',()=>openPicker(c.id,i,'src_path'));
+    on('[data-act="pick_dst"]',()=>openPicker(c.id,i,'dst_path'));
 
     // 大小范围：下拉切档位，选到「自定义」才显示输入框
     const presetSel=el.querySelector('[data-size="preset"]');
@@ -468,10 +483,10 @@ function bindRoute(c){
     if(presetSel){
       presetSel.onchange=()=>{
         const v=presetSel.value;
-        if(v==='custom'){ customRow.style.display=''; customInp.focus(); return; }
+        if(v==='custom'){ if(customRow) customRow.style.display=''; if(customInp) customInp.focus(); return; }
         const parts=v.split('|');
         r.min_size=parts[0]; r.max_size=parts[1];
-        customRow.style.display='none';
+        if(customRow) customRow.style.display='none';
       };
     }
     if(customInp){
@@ -480,11 +495,13 @@ function bindRoute(c){
       customInp.addEventListener('change',apply);
     }
   });
-  $('addRoute').onclick=()=>{ routes.push({name:'路线'+(routes.length+1),src_path:'',dst_path:'',mode:'copy',enabled:true,overwrite:false,delete_empty_dirs:false,schedule_type:'interval',interval_minutes:30,run_at:'03:00',min_size:'',max_size:''}); renderPanel(); };
-  $('saveRoutes').onclick=async()=>{ const r=await persist(); const j=await r.json(); msg(j.ok?'路线已保存':'保存失败：'+j.error); };
-  $('runAll').onclick=async()=>{ const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id})}); const j=await r.json(); msg(j.ok?('已触发 '+j.started+' 条'):'触发失败：'+j.error); poll(); };
+  // 按钮统一用「取到才绑定」，任何一个缺失都不会让「+ 添加路线」失效
+  const bind=(id,fn)=>{ const n=$(id); if(n) n.onclick=fn; };
+  bind('addRoute',()=>{ routes.push({name:'路线'+(routes.length+1),src_path:'',dst_path:'',mode:'copy',enabled:true,overwrite:false,delete_empty_dirs:false,schedule_type:'interval',interval_minutes:30,run_at:'03:00',min_size:'',max_size:''}); renderPanel(); });
+  bind('saveRoutes',async()=>{ const r=await persist(); const j=await r.json(); msg(j.ok?'路线已保存':'保存失败：'+j.error); });
+  bind('runAll',async()=>{ const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({conn_id:c.id})}); const j=await r.json(); msg(j.ok?('已触发 '+j.started+' 条'):'触发失败：'+j.error); poll(); });
 }
-function msg(t){ const m=$('msg'); if(m) m.textContent=t; }
+function msg(t){ const m=$('routeMsg')||$('msg'); if(m) m.textContent=t; }
 function addConn(){ const id='conn-'+Date.now(); conns.push({id:id,name:'新账号',url:'',username:'',password:'',tested_ok:false,routes:[]}); activeId=id; renderTabs(); renderPanel(); }
 function delConn(id){ const c=connById(id); if(c&&c.tested_ok && !confirm('确定删除账号「'+(c.name||'')+'」及其所有路线？')) return; conns=conns.filter(x=>x.id!==id); if(activeId===id) activeId=conns[0]?conns[0].id:null; persist(); renderTabs(); renderPanel(); }
 
