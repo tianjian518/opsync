@@ -74,6 +74,12 @@ def load_config():
     except FileNotFoundError:
         cfg = {}
     cfg.setdefault("openlists", [])
+    # 每个账号都补上 routes 数组：TOML 里没法表达「空表数组」（_emit_table 会跳过空列表），
+    # 所以账号还没有路线时读出来就是没有 routes 键。这里统一补 []，
+    # 前端拿到后就能直接 push 新路线（否则界面「+ 添加路线」会点了没反应）。
+    for ol in cfg["openlists"]:
+        if not isinstance(ol.get("routes"), list):
+            ol["routes"] = []
     apply_env(cfg)
     return cfg, path
 

@@ -9,9 +9,11 @@
   - 大小字符串解析（GB/MB/KB/B、裸数字按 MB）
 """
 
+import os
 import unittest
 from unittest.mock import patch
 
+import confighelper
 import sync
 
 
@@ -248,6 +250,61 @@ class TestParseSize(unittest.TestCase):
         self.assertTrue(sync.in_range(200, 100, 0))
         self.assertFalse(sync.in_range(50, 100, 0))
         self.assertIn("不限", sync.describe_range({}))
+
+
+class TestConfigRoutesNormalized(unittest.TestCase):
+    """回归：账号没有 routes 键时，读出来必须补成 []。
+
+    背景：TOML 无法表达「空表数组」（序列化时会跳过空列表），所以一个还没有
+    任何路线的账号，落盘的文件里就没有 routes 键。前端如果拿到 undefined，
+    「+ 添加路线」会因为数组没写回 c.routes 而表现为点了没反应。
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "config.toml")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _load(self):
+        old = os.environ.get("CONFIG_PATH")
+        os.environ["CONFIG_PATH"] = self.path
+        try:
+            return confighelper.load_config()[0]
+        finally:
+            if old is None:
+                os.environ.pop("CONFIG_PATH", None)
+            else:
+                os.environ["CONFIG_PATH"] = old
+
+    def test_missing_routes_key_becomes_empty_list(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('[[openlists]]\nid = "c1"\nname = "C1"\ntested_ok = true\n')
+        cfg = self._load()
+        self.assertEqual(cfg["openlists"][0]["routes"], [])
+
+    def test_empty_routes_survive_round_trip(self):
+        """空 routes 写盘再读回，仍应是 []（而不是缺键）。"""
+        cfg = {"openlists": [{"id": "c1", "name": "C1", "routes": []}]}
+        confighelper.write_toml(self.path, cfg)
+        self.assertEqual(self._load()["openlists"][0]["routes"], [])
+
+    def test_existing_routes_preserved(self):
+        cfg = {"openlists": [{"id": "c1", "name": "C1", "routes": [
+            {"name": "r1", "min_size": "1GB", "max_size": "10GB"},
+        ]}]}
+        confighelper.write_toml(self.path, cfg)
+        loaded = self._load()
+        self.assertEqual(len(loaded["openlists"][0]["routes"]), 1)
+        self.assertEqual(loaded["openlists"][0]["routes"][0]["max_size"], "10GB")
+
+    def test_no_openlists_key(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("[logging]\nlevel = \"INFO\"\n")
+        self.assertEqual(self._load()["openlists"], [])
 
 
 if __name__ == "__main__":

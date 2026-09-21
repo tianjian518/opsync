@@ -360,7 +360,8 @@ function renderPanel(){
   $('saveTest').onclick = async ()=>{ syncForm(c); $('connMsg').textContent='测试中…'; const r=await fetch('/api/connection-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:c.url,username:c.username,password:c.password})}); const j=await r.json(); c.tested_ok=j.ok; if(!j.ok){ $('connMsg').textContent='连接失败：'+j.error; return; } const rp=await persist(); const rpj=await rp.json(); $('connMsg').textContent=rpj.ok?'连接成功并已保存':'保存失败：'+rpj.error; renderTabs(); renderPanel(); };
 
   if(tested){
-    const rs=(c.routes||[]).map((r,i)=>routeHTML(c,r,i)).join('');
+    if(!Array.isArray(c.routes)) c.routes=[];
+    const rs=c.routes.map((r,i)=>routeHTML(c,r,i)).join('');
     const sec=document.createElement('section'); sec.innerHTML='<h2>搬运路线（账号：'+(c.name||'')+'）</h2>'+rs+
       '<div class="actions"><button class="ghost" id="addRoute">+ 添加路线</button>'+
       '<button id="saveRoutes">保存路线</button>'+
@@ -443,7 +444,12 @@ function routeHTML(c,r,i){
     '</div>';
 }
 function bindRoute(c){
-  const routes=c.routes||[];
+  // 注意：必须把数组「写回」c.routes，不能只用 const routes=c.routes||[]。
+  // 否则账号还没有 routes 键时（新账号 / 手写配置没写空数组），
+  // routes 只是一个游离的临时数组，renderPanel() 从 c.routes 重新渲染时看不到它，
+  // 表现为「+ 添加路线」点了没反应。
+  if(!Array.isArray(c.routes)) c.routes=[];
+  const routes=c.routes;
   routes.forEach((r,i)=>{
     const el=document.querySelector('.route[data-i="'+i+'"]');
     el.querySelectorAll('[data-f]').forEach(inp=>{
@@ -494,7 +500,7 @@ async function renderPicker(){
 }
 $('pickerUp').onclick=()=>{ if(picker.path==='/')return; const p=picker.path.replace(/\/$/,''); picker.path= p.includes('/')? p.slice(0,p.lastIndexOf('/'))||'/' : '/'; renderPicker(); };
 $('pickerCancel').onclick=()=>{ $('picker').style.display='none'; };
-$('pickerOk').onclick=()=>{ const c=connById(picker.connId); if(c&&c.routes[picker.routeIdx]) c.routes[picker.routeIdx][picker.field]=picker.path; $('picker').style.display='none'; renderPanel(); };
+$('pickerOk').onclick=()=>{ const c=connById(picker.connId); if(c&&Array.isArray(c.routes)&&c.routes[picker.routeIdx]) c.routes[picker.routeIdx][picker.field]=picker.path; $('picker').style.display='none'; renderPanel(); };
 
 async function poll(){
   try{
